@@ -1,6 +1,5 @@
 import os
 import sys
-
 import numpy as np
 import ollama
 import pdfplumber
@@ -8,7 +7,7 @@ import pdfplumber
 PDF_PATH = os.environ.get("PDF_PATH", "AI Module.pdf")
 CHUNK_SIZE = 1024
 OVERLAP_SIZE = 200
-EMBED_MODEL = "nomic-embed-text"
+EMBED_MODEL = "nomic-embed-text:latest"
 THINKING_MODEL = "llama3.1:latest"
 BATCH_SIZE = 32
 TOP_K = 3
@@ -80,12 +79,7 @@ def search(query, vector_db, text_metadata):
     response = ollama.embed(model=EMBED_MODEL, input=query)
     query_embedding = response["embeddings"][0]
     query_vector = np.array(query_embedding, dtype=np.float32)
-    query_norm = np.linalg.norm(query_vector)
-    if query_norm == 0:
-        return []
-
-    db_norms = np.linalg.norm(vector_db, axis=1)
-    similarities = vector_db.dot(query_vector) / (db_norms * query_norm + 1e-10)
+    similarities = np.dot(vector_db, query_vector)
     top_indices = np.argsort(similarities)[-TOP_K:][::-1]
     return [text_metadata[i] for i in top_indices]
 
@@ -105,7 +99,6 @@ Answer:
 
     response = ollama.generate(model=THINKING_MODEL, prompt=prompt)
     return response["response"]
-
 
 def chat_pdf(vector_db, text_metadata):
     while True:
@@ -127,9 +120,45 @@ def chat_pdf(vector_db, text_metadata):
         pages = sorted({res["page"] for res in results})
         print(f"Sources: [Page {', '.join(map(str, pages))}]\n")
 
+def verify_normalized_embedding(embeddings):
+    """
+        How to Check if the Output is Normalized
+        In the context of embeddings, "normalization" almost always refers to Vector Normalization (L2),
+        which ensures the embedding has a magnitude (length) of exactly 1.
+        You can check this mathematically using Python.
+        If the sum of the squares of all numbers in the embedding vector equals approximately 1.0, it is normalized.
+    """
+    embeddings_array = np.array(embeddings)
+    norms = np.linalg.norm(embeddings_array, axis=1)
+
+    all_normalized = np.all(np.isclose(norms, 1.0))
+
+    print(f"Vector Magnitude: {norms}")
+
+    if all_normalized:
+        print("The embedding is L2 normalized.")
+    else:
+        print("The embedding is NOT normalized.")
+
+# verify if ollama is up and running
+def check_ollama_status():
+    try:
+        response = ollama.list()
+        downloaded_models=[model.get("model") for model in response.get("models",[])]
+        is_model_missing = [model for model in [EMBED_MODEL,THINKING_MODEL] if model not in downloaded_models]
+
+        if not is_model_missing:
+            return True
+        else:
+            return False
+    except Exception as exc:
+        return False
 
 if __name__ == '__main__':
     print('Welcome to Chat with PDF.')
+    if not check_ollama_status():
+        print("Please start Ollama or run 'ollama pull <model_name>' for missing models.")
+        sys.exit(1)
     texts = readpdf()
     if not texts:
         print("No text found in PDF.")
@@ -145,6 +174,7 @@ if __name__ == '__main__':
 
     text_data = [item["text"] for item in all_metadata]
     vectors = generate_embeddings_batch(text_data)
+    verify_normalized_embedding(vectors)  # Check the first embedding for normalization
     if not vectors:
         print("No embeddings were generated.")
         sys.exit(1)
