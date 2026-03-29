@@ -1,3 +1,5 @@
 pdfplumber
 ollama
 numpy
+faiss-cpu
+flashrank
