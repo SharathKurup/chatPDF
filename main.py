@@ -1,125 +1,166 @@
-import pdfplumber
-import ollama
-import numpy as np
+import os
+import sys
 
-PDF_PATH = "AI Module.pdf"
+import numpy as np
+import ollama
+import pdfplumber
+
+PDF_PATH = os.environ.get("PDF_PATH", "AI Module.pdf")
 CHUNK_SIZE = 1024
 OVERLAP_SIZE = 200
 EMBED_MODEL = "nomic-embed-text"
-THINKING_MODEL = "llama3.1:latest "
-BATCH_SIZE=32
-TOP_K=3
+THINKING_MODEL = "llama3.1:latest"
+BATCH_SIZE = 32
+TOP_K = 3
 
 def readpdf():
-    print("Reading PDF...")
-    all_texts=[];
-    with pdfplumber.open(PDF_PATH) as pdf:
-        for i,page in enumerate(pdf.pages):
-            text = page.extract_text()
-            all_texts.append(text)
+    print(f"Reading PDF: {PDF_PATH}")
+    all_texts = []
+
+    try:
+        with pdfplumber.open(PDF_PATH) as pdf:
+            for i, page in enumerate(pdf.pages):
+                text = page.extract_text() or ""
+                if not text.strip():
+                    continue
+                all_texts.append((i + 1, text))
+    except FileNotFoundError:
+        print(f"PDF not found: {PDF_PATH}")
+        sys.exit(1)
+    except Exception as exc:
+        print(f"Failed to read PDF: {exc}")
+        sys.exit(1)
+
     return all_texts
 
-def generate_chunks(text):
-    chunks =[]
-    i=0
-    while i<len(text):
-        end = min (i+CHUNK_SIZE, len(text))
+def generate_chunks(text, page_num):
+    if not text:
+        return []
+
+    chunks = []
+    i = 0
+    while i < len(text):
+        end = min(i + CHUNK_SIZE, len(text))
         chunk = text[i:end]
 
         if end < len(text):
             last_space = chunk.rfind(" ")
             if last_space != -1:
-                end = i+ last_space
-                chunk = chunk[i:end]
+                end = i + last_space
+                chunk = text[i:end]
 
-        chunks.append(chunk)
+        chunk = chunk.strip()
+        if chunk:
+            chunks.append({"text": chunk, "page": page_num})
+
         i = end - OVERLAP_SIZE
-
-        if i >= len(text) or (end == len(text)):
+        if i < 0:
+            i = 0
+        if i >= len(text) or end == len(text):
             break
 
     return chunks
-    # print all chunks
-    # for chunk in chunks:
-    #     print(chunk)
 
-    # for i in range (0, len(text), CHUNK_SIZE-OVERLAP_SIZE):
-    #     chunk = text[i:i+CHUNK_SIZE]
-    #     print (chunk)
-
-def generate_embeddings_batch(chunks):
+def generate_embeddings_batch(texts):
     all_embeddings = []
-    for i in range(0, len(chunks), BATCH_SIZE):
-        batch_chunks= chunks[i:i+BATCH_SIZE]
-        response = ollama.embed(model=EMBED_MODEL, input=batch_chunks)
+    for i in range(0, len(texts), BATCH_SIZE):
+        batch_texts = texts[i:i+BATCH_SIZE]
+        try:
+            response = ollama.embed(model=EMBED_MODEL, input=batch_texts)
+        except Exception as exc:
+            raise RuntimeError(f"Embedding request failed: {exc}") from exc
         all_embeddings.extend(response["embeddings"])
     return all_embeddings
 
 def search(query, vector_db, text_metadata):
-    query_embedding = ollama.embed(model=EMBED_MODEL, input=query)["embeddings"][0]
-    query_vector=np.array(query_embedding)
-    similarities = np.dot(vector_db, query_vector)
-    top_indices = np.argsort(similarities) [-TOP_K:][::-1]
+    query = query.strip()
+    if not query:
+        return []
+
+    response = ollama.embed(model=EMBED_MODEL, input=query)
+    query_embedding = response["embeddings"][0]
+    query_vector = np.array(query_embedding, dtype=np.float32)
+    query_norm = np.linalg.norm(query_vector)
+    if query_norm == 0:
+        return []
+
+    db_norms = np.linalg.norm(vector_db, axis=1)
+    similarities = vector_db.dot(query_vector) / (db_norms * query_norm + 1e-10)
+    top_indices = np.argsort(similarities)[-TOP_K:][::-1]
     return [text_metadata[i] for i in top_indices]
 
 def generate_answer(query, chunks):
-    context_chunks="".join(chunks)
-
+    context_chunks = "\n\n".join(chunks).strip()
     prompt = f"""
-    You are a helpful assistant. Use the following pieces of retrieved context 
-    to answer the user's question. If you don't know the answer based on the 
-    context, just say that you don't know.
+You are a helpful assistant. Use the following pieces of retrieved context to answer the user's question. If you don't know the answer based on the context, just say that you don't know.
 
-    Context:
-    {context_chunks}
+Context:
+{context_chunks}
 
-    Question: 
-    {query}
+Question:
+{query}
 
-    Answer:
-    """
+Answer:
+"""
 
     response = ollama.generate(model=THINKING_MODEL, prompt=prompt)
-    # print(response)
-    # return response["answers"][0]["text"]
     return response["response"]
 
-def chat_pdf(vector_db,text_metadata):
 
-    while(True):
-        user_query = input("You - ")
-        if user_query == 'exit':
+def chat_pdf(vector_db, text_metadata):
+    while True:
+        user_query = input("You - ").strip()
+        if not user_query:
+            continue
+        if user_query.lower() in {"exit", "quit"}:
             break
+
         results = search(user_query, vector_db, text_metadata)
-        response = generate_answer(user_query, results)
+        if not results:
+            print("No relevant content found for that query.")
+            continue
+
+        context_llm = [res["text"] for res in results]
+        response = generate_answer(user_query, context_llm)
         print(f"--- Response ---\n{response}\n")
 
-def print_all(text): # print all texts
-    chunks = 1024
-    for i in range(0, len(final_text), chunks):
-        print(final_text[i:i + chunks])
+        pages = sorted({res["page"] for res in results})
+        print(f"Sources: [Page {', '.join(map(str, pages))}]\n")
+
 
 if __name__ == '__main__':
     print('Welcome to Chat with PDF.')
     texts = readpdf()
-    final_text = "".join(texts)
-    chunks = generate_chunks(final_text)
-    vectors = generate_embeddings_batch(chunks)
+    if not texts:
+        print("No text found in PDF.")
+        sys.exit(1)
 
-    vector_db = np.array(vectors)
-    text_metadata = chunks
-    chat_pdf(vector_db,text_metadata)
+    all_metadata = []
+    for page_num, page_content in texts:
+        all_metadata.extend(generate_chunks(page_content, page_num=page_num))
+
+    if not all_metadata:
+        print("No content chunks were created from the PDF.")
+        sys.exit(1)
+
+    text_data = [item["text"] for item in all_metadata]
+    vectors = generate_embeddings_batch(text_data)
+    if not vectors:
+        print("No embeddings were generated.")
+        sys.exit(1)
+
+    vector_db = np.array(vectors, dtype=np.float32)
+    text_metadata = all_metadata
+    chat_pdf(vector_db, text_metadata)
 
     # user_query = "What is the main topic of the PDF?"
     # user_query = "What does this mention about Heuristic based search?"
     # user_query="What is explanation facility? Explain with any examples provided by PDF."
     # user_query="Is anything mentioned as Knowledge representation and inference, and any examples provided for it?"
+    # user_query="What is the main topic of the PDF? What are the subtopics covered in it?"
+    # user_query="Explain in detail about Heuristic based search" # failing question
     # results = search(user_query, vector_db, text_metadata)
     #
     # response = generate_answer(user_query, chunks)
     # print(f"--- Query ---\n{user_query}\n")
     # print(f"--- Response ---\n{response}\n")
-
-    # for r in results:
-    #     print(f"--- Found Chunk ---\n{r}\n")
-    # print_all(final_text)
