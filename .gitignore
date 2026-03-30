@@ -5,3 +5,6 @@
 *.faiss
 *.pkl
 *.log
+/temp
+/model_cache
+/db

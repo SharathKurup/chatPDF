@@ -3,3 +3,4 @@ ollama
 numpy
 faiss-cpu
 flashrank
+streamlit

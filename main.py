@@ -8,6 +8,12 @@ import time
 import pickle
 import hashlib
 from flashrank import Ranker, RerankRequest
+import logging
+import streamlit as st
+
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
+st.set_page_config(page_title="Chat PDF", layout="wide")
 
 PDF_PATH = os.environ.get("PDF_PATH", "AI Module.pdf")
 CHUNK_SIZE = 1024
@@ -20,20 +26,25 @@ STREAM = True
 KEEP_ALIVE = '1h'
 DB_FOLDER = "db"
 OVERRIDE_DB = False
+RERANK_MODEL = "ms-marco-MiniLM-L-12-v2" # https://huggingface.co/prithivida/flashrank/tree/main
+CACHE_DIR = "./model_cache"
+TEMP_PATH = "./temp"
 
-def readpdf():
-    print(f"Reading PDF: {PDF_PATH}")
+# https://github.com/PrithivirajDamodaran/FlashRank
+
+def readpdf(pdf_file):
+    print(f"Reading PDF: {pdf_file}")
     all_texts = []
 
     try:
-        with pdfplumber.open(PDF_PATH) as pdf:
+        with pdfplumber.open(pdf_file) as pdf:
             for i, page in enumerate(pdf.pages):
                 text = page.extract_text() or ""
                 if not text.strip():
                     continue
                 all_texts.append((i + 1, text))
     except FileNotFoundError:
-        print(f"PDF not found: {PDF_PATH}")
+        print(f"PDF not found: {pdf_file}")
         sys.exit(1)
     except Exception as exc:
         print(f"Failed to read PDF: {exc}")
@@ -220,16 +231,20 @@ def load_vector_db():
         return index, data.get("metadata"), data.get("pdf_hash")
     return None, None, None
 
-def calculate_pdf_hash():
+def calculate_pdf_hash(pdf_file):
     sha256_hash = hashlib.sha256()
-    with open (PDF_PATH, "rb") as f:
+    with open (pdf_file, "rb") as f:
         for byte_block in iter(lambda: f.read(4096), b""):
             sha256_hash.update(byte_block)
     return sha256_hash.hexdigest()
 
-ranker = Ranker(model_name="ms-marco-MiniLM-L-12-v2",cache_dir="/tmp")
+@st.cache_resource
+def get_ranker():
+    return Ranker(model_name=RERANK_MODEL,cache_dir=CACHE_DIR)
+
 def search_with_rerank(query,index,text_metadata):
-    qquery = query.strip()
+    ranker = get_ranker()
+    query = query.strip()
     if not query:
         return []
 
@@ -256,42 +271,107 @@ def search_with_rerank(query,index,text_metadata):
     print("------------------------\n")
     return results[:TOP_K]
 
-if __name__ == '__main__':
-    print('Welcome to Chat with PDF.')
+def build_pipeline(pdf_file):
     if not check_ollama_status():
         print("Please start Ollama or run 'ollama pull <model_name>' for missing models.")
+        st.warning("Please start Ollama or run 'ollama pull <model_name>' for missing models.")
         sys.exit(1)
 
-    current_hash = calculate_pdf_hash()
-
+    current_hash = calculate_pdf_hash(pdf_file)
     index, metadata,stored_hash = load_vector_db()
-    if not index or current_hash != stored_hash or OVERRIDE_DB:
-        texts = readpdf()
-        if not texts:
-            print("No text found in PDF.")
-            sys.exit(1)
 
-        metadata = []
-        for page_num, page_content in texts:
-            metadata.extend(generate_chunks(page_content, page_num=page_num))
+    if index and metadata and current_hash == stored_hash and not OVERRIDE_DB:
+        st.info("Existing database found for this file. Loading...")
+        return index, metadata
 
-        if not metadata:
-            print("No content chunks were created from the PDF.")
-            sys.exit(1)
+    st.info("New PDF detected. Processing...")
+    texts = readpdf(pdf_file)
+    if not texts:
+        print("No text found in PDF.")
+        st.warning("No text found in PDF.")
+        sys.exit(1)
 
-        text_data = [item["text"] for item in metadata]
-        vectors = generate_embeddings_batch(text_data)
-        verify_normalized_embedding(vectors)
+    metadata = []
+    for page_num, page_content in texts:
+        metadata.extend(generate_chunks(page_content, page_num=page_num))
 
-        vector_np = np.array(vectors).astype('float32')
+    if not metadata:
+        print("No content chunks were created from the PDF.")
+        st.warning("No content chunks were created from the PDF.")
+        sys.exit(1)
 
-        dimension = vector_np.shape[1]
-        index = faiss.IndexFlatIP(dimension)
-        index.add(vector_np)
+    text_data = [item["text"] for item in metadata]
+    vectors = generate_embeddings_batch(text_data)
+    verify_normalized_embedding(vectors)
 
-        save_vector_db(index, metadata,current_hash)
+    vector_np = np.array(vectors).astype('float32')
 
-    chat_pdf(index, metadata)
+    dimension = vector_np.shape[1]
+    index = faiss.IndexFlatIP(dimension)
+    index.add(vector_np)
+
+    save_vector_db(index, metadata, current_hash)
+
+    return index, metadata
+
+
+# if __name__ == '__main__':
+#     print('Welcome to Chat with PDF.')
+#     index,metadata=build_pipeline(PDF_PATH)
+#     chat_pdf(index, metadata)
+
+with st.sidebar:
+    st.title("Document Settings")
+    uploaded_file = st.sidebar.file_uploader("Choose a PDF file", type=["pdf"])
+    if uploaded_file:
+        tmp_path = os.path.join(TEMP_PATH, uploaded_file.name)
+        if not os.path.exists(TEMP_PATH): os.mkdir(TEMP_PATH)
+
+        with open(tmp_path, "wb") as f:
+            f.write(uploaded_file.getbuffer())
+        st.sidebar.success(f"Uploaded: {uploaded_file.name}")
+
+        if st.button("Index & Start"):
+            with st.spinner(text="Analyzing document...",show_time=True):
+                idx,metadata=build_pipeline(tmp_path)
+                st.session_state.index = idx
+                st.session_state.metadata = metadata
+                st.success(f"Ready to Chat!")
+
+st.title("Chat with your PDF")
+
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
+
+if prompt := st.chat_input("Ask something about the PDF..."):
+    if "index" not in st.session_state:
+        st.error("Please upload and index a PDF first!")
+    else:
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
+
+        with st.chat_message("assistant"):
+            response_placeholder=st.empty()
+            full_response = ""
+
+            results = search_with_rerank(prompt, st.session_state.index, st.session_state.metadata)
+            context = [res["text"] for res in results]
+
+            for chunk in generate_answer(prompt, context):
+                full_response += chunk['response']
+                response_placeholder.markdown(full_response + "▌")
+
+            response_placeholder.markdown(full_response)
+
+            pages = sorted({res["page"] for res in results})
+            st.caption(f"Sources: Pages {', '.join(map(str, pages))}")
+
+        st.session_state.messages.append({"role": "assistant", "content": full_response})
 
     # vector_db = np.array(vectors, dtype=np.float32)
     # text_metadata = all_metadata
