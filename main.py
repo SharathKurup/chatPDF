@@ -10,6 +10,7 @@ import hashlib
 from flashrank import Ranker, RerankRequest
 import logging
 import streamlit as st
+import re
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
@@ -25,7 +26,7 @@ TOP_K = 3
 STREAM = True
 KEEP_ALIVE = '1h'
 DB_FOLDER = "db"
-OVERRIDE_DB = False
+OVERRIDE_DB = True
 RERANK_MODEL = "ms-marco-MiniLM-L-12-v2" # https://huggingface.co/prithivida/flashrank/tree/main
 CACHE_DIR = "./model_cache"
 TEMP_PATH = "./temp"
@@ -80,6 +81,50 @@ def generate_chunks(text, page_num):
 
     return chunks
 
+def generate_chunks_recursive(text, page_num, chunk_size, overlap_size):
+    if not text: return []
+    chunks = []
+    start = 0
+    min_chunk_size = 100  # Avoid tiny chunks at the end of pages
+
+    while start < len(text):
+        end = start + chunk_size
+
+        if end >= len(text):
+            chunk_text = text[start:].strip()
+            if chunk_text: chunks.append({"text": chunk_text, "page": page_num})
+            break
+
+        chunk_slice = text[start:end]
+
+        for separator in ["\n\n", "\n", ". ", " "]:
+            last_break = chunk_slice.rfind(separator)
+            if last_break != -1:
+                if separator == ". ": last_break += 1
+                break
+        else:
+            last_break = chunk_size
+
+        actual_end = start + last_break
+        final_chunk = text[start:actual_end].strip()
+
+        if len(final_chunk) > min_chunk_size:
+            chunks.append({"text": final_chunk, "page": page_num})
+            start = actual_end - overlap_size
+        else:
+            start = actual_end
+
+    return chunks
+
+def generate_advanced_chunks(page_content,page_num):
+    search_chunks = generate_chunks_recursive(page_content,page_num,CHUNK_SIZE,OVERLAP_SIZE)
+
+    for chunk in search_chunks:
+        chunk["text"] = f"[Page {page_num}] {chunk['text']}"
+        chunk["full_context"] = page_content
+
+    return search_chunks
+
 def generate_embeddings_batch(texts):
     all_embeddings = []
     for i in range(0, len(texts), BATCH_SIZE):
@@ -125,13 +170,28 @@ def search_faiss(query, index, text_metadata):
     print(f"Total time with FAISS: {execution_time}")
     return [text_metadata[i] for i in indices[0]]
 
-def generate_answer(query, chunks):
-    context_chunks = "\n\n".join(chunks).strip()
+def generate_answer(query, results, chat_history):
+    context_parts = []
+    for res in results:
+        context_parts.append(
+            f"--- START OF PAGE {res['page']} ---\n{res['full_context']}\n--- END OF PAGE {res['page']} ---")
+
+    history_text = "\n".join([f"{history['role']}: {history['content']}" for history in chat_history[-5:]])
+
+    context_text = "\n\n".join(context_parts).strip()
     prompt = f"""
-You are a helpful assistant. Use the following pieces of retrieved context to answer the user's question. If you don't know the answer based on the context, just say that you don't know.
+You are a professional research assistant. Use the provided context to answer the question accurately.
+
+Instructions:
+1. Every time you state a fact from the context, cite the page number immediately after the sentence in brackets, like this: [Page X].
+2. If the answer isn't in the context, clearly state that you don't know.
+3. Keep your response structured and easy to read.
 
 Context:
-{context_chunks}
+{context_text}
+
+Conversation History:
+{history_text}
 
 Question:
 {query}
@@ -248,6 +308,8 @@ def search_with_rerank(query,index,text_metadata):
     if not query:
         return []
 
+    page_match = re.search(r"page\s+(\d+)", query.lower())
+    target_page = int(page_match.group(1)) if page_match else None
     response = ollama.embed(model=EMBED_MODEL, input=query)
 
     query_embedding = response["embeddings"][0]
@@ -258,9 +320,20 @@ def search_with_rerank(query,index,text_metadata):
     execution_time = end_time - start_time
 
     candidates = [text_metadata[i] for i in indices[0]]
+
+    if target_page:
+        page_specific_chunks = [_text for _text in text_metadata if _text["page"] == target_page]
+        candidates = page_specific_chunks[:3] + candidates
+
     rerank_items = [
-        {"id":i, "text":candidate["text"],"page":candidate["page"]}
-        for i,candidate in enumerate(candidates)]
+        {
+            "id": i,
+            "text": candidate["text"],
+            "page": candidate["page"],
+            "full_context": candidate.get("full_context", "")  # Add this line
+        }
+        for i, candidate in enumerate(candidates)
+    ]
     rerank_request = RerankRequest(query=query,passages=rerank_items)
     results = ranker.rerank(rerank_request)
     print(f"Total time with FAISS: {execution_time}")
@@ -293,7 +366,7 @@ def build_pipeline(pdf_file):
 
     metadata = []
     for page_num, page_content in texts:
-        metadata.extend(generate_chunks(page_content, page_num=page_num))
+        metadata.extend(generate_advanced_chunks(page_content, page_num))
 
     if not metadata:
         print("No content chunks were created from the PDF.")
@@ -338,6 +411,10 @@ with st.sidebar:
                 st.session_state.metadata = metadata
                 st.success(f"Ready to Chat!")
 
+        if st.button("🗑️ Clear Chat History"):
+            st.session_state.messages = []
+            st.rerun()
+
 st.title("Chat with your PDF")
 
 if "messages" not in st.session_state:
@@ -360,9 +437,9 @@ if prompt := st.chat_input("Ask something about the PDF..."):
             full_response = ""
 
             results = search_with_rerank(prompt, st.session_state.index, st.session_state.metadata)
-            context = [res["text"] for res in results]
+            context = [res["full_context"] for res in results]
 
-            for chunk in generate_answer(prompt, context):
+            for chunk in generate_answer(prompt, results, st.session_state.messages):
                 full_response += chunk['response']
                 response_placeholder.markdown(full_response + "▌")
 

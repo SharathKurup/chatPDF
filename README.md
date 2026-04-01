@@ -1,13 +1,15 @@
 # chatPDF
 
-A conversational AI application that allows you to chat with PDF documents using local language models, semantic search, and intelligent result re-ranking.
+A conversational AI web application built with Streamlit that allows you to chat with PDF documents using local language models, semantic search, and intelligent result re-ranking.
 
 ## Features
 
+- 🌐 **Web Interface**: User-friendly Streamlit web app for easy PDF upload and chat
 - 📄 **PDF Processing**: Extract and process text from PDF documents
 - 🔍 **Semantic Search with FAISS**: Fast vector similarity search using FAISS for efficient retrieval
 - 🎯 **Intelligent Re-ranking**: Uses FlashRank to re-rank search results for better relevance
 - 💬 **Conversational Interface**: Ask questions about your PDF in a natural, interactive way
+- 🧠 **Conversational Memory**: Maintains chat history for contextual follow-up questions
 - 🤖 **Local LLM Integration**: Powered by Ollama for private, on-device processing
 - 📚 **Context-Aware Responses**: Provides answers based on relevant chunks from your PDF
 - 💾 **Persistent Vector Database**: Caches embeddings with automatic updates when PDF changes
@@ -16,11 +18,11 @@ A conversational AI application that allows you to chat with PDF documents using
 ## How It Works
 
 1. **PDF Reading**: Extracts text from all pages of a PDF document
-2. **Chunking**: Divides the text into overlapping chunks for better context preservation
+2. **Chunking**: Uses recursive splitting with intelligent separators (e.g., paragraphs, sentences) to divide text into overlapping chunks for better context preservation and optimization
 3. **Embedding Generation**: Creates vector embeddings for each chunk using Ollama's embedding model (L2-normalized)
 4. **FAISS Indexing**: Stores embeddings in a FAISS vector index (IndexFlatIP) for fast similarity search
-5. **Semantic Search**: When you ask a question, it retrieves the top 10 most relevant chunks using FAISS similarity search
-6. **Re-ranking**: FlashRank re-ranks the retrieved chunks using the MS-MARCO-MiniLM model for improved relevance
+5. **Semantic Search with Small-to-Big Retrieval**: Retrieves a larger set of candidate chunks (top 10) using FAISS similarity search, then employs Small-to-Big Retrieval by re-ranking them for improved relevance
+6. **Re-ranking**: FlashRank re-ranks the retrieved chunks using the MS-MARCO-MiniLM model for better accuracy
 7. **Answer Generation**: Uses an LLM to generate accurate answers based on the top re-ranked chunks
 
 ## Vector Database Persistence
@@ -38,6 +40,7 @@ The application automatically caches the vector database and embedding vectors:
 - Python 3.7 or higher
 - [Ollama](https://ollama.ai) installed and running locally
 - Required Python packages (see installation section):
+  - **streamlit**: For the web interface
   - **pdfplumber**: For PDF text extraction
   - **ollama**: For local LLM and embedding model access
   - **numpy**: For vector operations and similarity calculations
@@ -55,6 +58,7 @@ pip install -r requirements.txt
 ```
 
 The following packages will be installed:
+- **streamlit**: For building the web interface
 - **pdfplumber**: For extracting text from PDF documents
 - **ollama**: For accessing local LLM and embedding models running on Ollama
 - **numpy**: For efficient vector operations and mathematical calculations
@@ -91,29 +95,23 @@ Or if Ollama is installed as a service, it will start automatically on system st
 
 ## Usage
 
-### Prepare Your PDF
-
-Place your PDF file in the project directory and update the `PDF_PATH` variable in `main.py`:
-
-```python
-PDF_PATH = "your_pdf_file.pdf"
-```
-
 ### Run the Application
 
+To start the Streamlit web application, run:
+
 ```bash
-python main.py
+streamlit run main.py
 ```
 
-### Interactive Chat
+This will launch the app in your default web browser at `http://localhost:8501`.
 
-Once the application starts:
+### Using the Web Interface
 
-1. The PDF will be automatically processed and indexed
-2. You'll see the prompt: `You - `
-3. Type your questions about the PDF content
-4. The AI will search for relevant sections and provide answers
-5. Type `exit` to quit the application
+1. **Upload a PDF**: Use the file uploader in the sidebar to select and upload your PDF document.
+2. **Index the Document**: Click the "Index & Start" button to process and index the PDF. This may take a few moments for large documents.
+3. **Start Chatting**: Once indexed, you can ask questions about the PDF content in the chat input box.
+4. **View Responses**: The AI will provide answers based on the document, with sources cited by page numbers.
+5. **Clear Chat History**: Use the "🗑️ Clear Chat History" button in the sidebar to reset the conversation.
 
 ### Example Queries
 
@@ -195,7 +193,7 @@ KEEP_ALIVE = '1h'          # How long to keep the Ollama model in memory (reduce
 
 ### Re-ranking Results Not Showing
 - Ensure FlashRank is properly installed: `pip install flashrank`
-- The re-ranking model will be downloaded on first use to `/tmp` (or custom cache directory)
+- The re-ranking model will be downloaded on first use to `/model_cache` (or custom cache directory)
 - Internet connection is required for initial model download
 
 ## Project Structure
@@ -204,13 +202,12 @@ KEEP_ALIVE = '1h'          # How long to keep the Ollama model in memory (reduce
 chatPDF/
 ├── main.py              # Main application script
 ├── requirements.txt     # Python dependencies
-├── README.md           # This file
-├── AI Module.pdf       # Your PDF document
-├── db/                 # Vector database storage (auto-created)
-│   ├── index.faiss     # FAISS vector index
-│   └── metadata.pkl    # Chunk metadata and PDF hash
-├── tmp/                # Temporary files and model cache
-└── __pycache__/        # Python bytecode cache
+├── README.md            # This file
+├── db/                  # Vector database storage (auto-created)
+│   ├── index.faiss      # FAISS vector index
+│   └── metadata.pkl     # Chunk metadata and PDF hash
+├── model_cache/         # Model cache for FlashRank and other models
+└── temp/                # Temporary files for uploaded PDFs
 ```
 
 ## System Requirements
@@ -226,9 +223,7 @@ This project is open source and available for personal and educational use.
 
 ## Future Enhancements
 
-- Web interface
 - Support for multiple PDF files
-- Persistent vector database
 - Export chat history
 - Custom model selection
 - Document summarization
@@ -240,4 +235,3 @@ Feel free to fork this project, make improvements, and submit pull requests.
 ## Support
 
 For issues or questions, please check the troubleshooting section or create an issue in the repository.
-
