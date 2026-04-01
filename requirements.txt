@@ -4,3 +4,4 @@ numpy
 faiss-cpu
 flashrank
 streamlit
+psutil

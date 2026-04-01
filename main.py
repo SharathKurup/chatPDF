@@ -11,10 +11,13 @@ from flashrank import Ranker, RerankRequest
 import logging
 import streamlit as st
 import re
+import psutil
+
+# Set this at the very top of your script, before any ollama calls
+os.environ["OLLAMA_FLASH_ATTENTION"] = "1"
+os.environ["OLLAMA_KV_CACHE_TYPE"] = "q8_0" # Another 2026 speed optimization
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
-
-st.set_page_config(page_title="Chat PDF", layout="wide")
 
 PDF_PATH = os.environ.get("PDF_PATH", "AI Module.pdf")
 CHUNK_SIZE = 1024
@@ -22,14 +25,15 @@ OVERLAP_SIZE = 200
 EMBED_MODEL = "nomic-embed-text:latest"
 THINKING_MODEL = "llama3.1:latest"
 BATCH_SIZE = 32
-TOP_K = 3
+TOP_K = 2
 STREAM = True
 KEEP_ALIVE = '1h'
 DB_FOLDER = "db"
-OVERRIDE_DB = True
+OVERRIDE_DB = False
 RERANK_MODEL = "ms-marco-MiniLM-L-12-v2" # https://huggingface.co/prithivida/flashrank/tree/main
 CACHE_DIR = "./model_cache"
 TEMP_PATH = "./temp"
+MAX_SENTENCES = 8
 
 # https://github.com/PrithivirajDamodaran/FlashRank
 
@@ -52,6 +56,14 @@ def readpdf(pdf_file):
         sys.exit(1)
 
     return all_texts
+
+def get_safe_threads():
+    # Returns logical cores. For a 16-core CPU, this returns 16.
+    # We subtract 1 or 2 to keep the OS and Streamlit responsive.
+    cores = psutil.cpu_count(logical=True)
+    return max(1, cores - 2)
+
+st.set_page_config(page_title="Chat PDF", layout="wide")
 
 def generate_chunks(text, page_num):
     if not text:
@@ -170,11 +182,28 @@ def search_faiss(query, index, text_metadata):
     print(f"Total time with FAISS: {execution_time}")
     return [text_metadata[i] for i in indices[0]]
 
-def generate_answer(query, results, chat_history):
+def generate_answer(query, results, chat_history,threads,temp):
+    options = {
+        "num_thread": threads,
+        "temperature": temp
+        # "num_ctx": 8192  # Limits context window to keep it fast
+    }
+
+    raw_context_tokens = sum(estimate_tokens(res['full_context']) for res in results)
     context_parts = []
     for res in results:
+        compressed_text = compress_context(query, res['full_context'])
         context_parts.append(
-            f"--- START OF PAGE {res['page']} ---\n{res['full_context']}\n--- END OF PAGE {res['page']} ---")
+            f"--- START OF PAGE {res['page']} ---\n{compressed_text}\n--- END OF PAGE {res['page']} ---")
+
+    compressed_context_text = "\n\n".join(context_parts).strip()
+    compressed_tokens = estimate_tokens(compressed_context_text)
+
+    stats = {
+        "raw_tokens": raw_context_tokens,
+        "compressed_tokens": compressed_tokens,
+        "saved_tokens": raw_context_tokens - compressed_tokens
+    }
 
     history_text = "\n".join([f"{history['role']}: {history['content']}" for history in chat_history[-5:]])
 
@@ -198,15 +227,16 @@ Question:
 
 Answer:
 """
-    if STREAM:
-        return ollama.generate(
-            model=THINKING_MODEL,
-            prompt=prompt,
-            stream=STREAM,
-            keep_alive=KEEP_ALIVE
-        )
-    response = ollama.generate(model=THINKING_MODEL, prompt=prompt, keep_alive=KEEP_ALIVE)
-    return response["response"]
+    # if STREAM:
+    return ollama.generate(
+        model=THINKING_MODEL,
+        prompt=prompt,
+        stream=STREAM,
+        keep_alive=KEEP_ALIVE,
+        options=options,
+    ),stats
+    # response = ollama.generate(model=THINKING_MODEL, prompt=prompt, keep_alive=KEEP_ALIVE)
+    # return response["response"],stats
 
 def chat_pdf(index, text_metadata):
     while True:
@@ -258,7 +288,6 @@ def verify_normalized_embedding(embeddings):
     else:
         print("The embedding is NOT normalized.")
 
-# verify if ollama is up and running
 def check_ollama_status():
     try:
         response = ollama.list()
@@ -344,6 +373,28 @@ def search_with_rerank(query,index,text_metadata):
     print("------------------------\n")
     return results[:TOP_K]
 
+def compress_context(query, full_text):
+    # Split into sentences
+    sentences = re.split(r'(?<=[.!?]) +', full_text)
+    query_words = set(query.lower().split())
+
+    scored_sentences = []
+    for s in sentences:
+        # Score sentence based on keyword overlap with query
+        score = sum(1 for word in s.lower().split() if word in query_words)
+        scored_sentences.append((score, s))
+
+    # Sort by score and take the top sentences, then re-sort by original order
+    top_sentences = sorted(scored_sentences, key=lambda x: x[0], reverse=True)[:MAX_SENTENCES]
+    # Re-sort to maintain document flow
+    compressed = " ".join([s for _, s in top_sentences])
+
+    return compressed if compressed else full_text[:1000]  # Fallback to snippet
+
+def estimate_tokens(text):
+    # Standard approximation: 1 token ≈ 4 characters or 0.75 words
+    return len(text) // 4
+
 def build_pipeline(pdf_file):
     if not check_ollama_status():
         print("Please start Ollama or run 'ollama pull <model_name>' for missing models.")
@@ -415,6 +466,11 @@ with st.sidebar:
             st.session_state.messages = []
             st.rerun()
 
+        st.subheader("⚙️ Performance Tuning")
+        user_threads = st.slider("CPU Threads", 1, psutil.cpu_count(), get_safe_threads())
+        use_flash = st.toggle("Flash Attention", value=True)
+        temperature = st.slider("Creativity (Temp)", 0.0, 1.0, 0.1)
+
 st.title("Chat with your PDF")
 
 if "messages" not in st.session_state:
@@ -437,11 +493,26 @@ if prompt := st.chat_input("Ask something about the PDF..."):
             full_response = ""
 
             results = search_with_rerank(prompt, st.session_state.index, st.session_state.metadata)
-            context = [res["full_context"] for res in results]
 
-            for chunk in generate_answer(prompt, results, st.session_state.messages):
+            start_gen = time.perf_counter()
+
+            stream_response,stats = generate_answer(prompt, results, st.session_state.messages,user_threads,temperature)
+
+            for chunk in stream_response:
                 full_response += chunk['response']
                 response_placeholder.markdown(full_response + "▌")
+
+            end_gen = time.perf_counter()
+            gen_time = end_gen - start_gen
+
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Time Taken", f"{gen_time:.2f}s")
+            col2.metric("Tokens Used", f"{stats['compressed_tokens']}")
+            col3.metric("Tokens Saved", f"{stats['saved_tokens']}", delta_color="normal")
+
+            # for chunk in generate_answer(prompt, results, st.session_state.messages):
+            #     full_response += chunk['response']
+            #     response_placeholder.markdown(full_response + "▌")
 
             response_placeholder.markdown(full_response)
 
