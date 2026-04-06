@@ -5,3 +5,4 @@ faiss-cpu
 flashrank
 streamlit
 psutil
+tiktoken

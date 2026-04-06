@@ -12,20 +12,29 @@ import logging
 import streamlit as st
 import re
 import psutil
+import tiktoken
+import subprocess
+import atexit
 
-# Set this at the very top of your script, before any ollama calls
-os.environ["OLLAMA_FLASH_ATTENTION"] = "1"
-os.environ["OLLAMA_KV_CACHE_TYPE"] = "q8_0" # Another 2026 speed optimization
+ollama_env = os.environ.copy()
+ollama_env["OLLAMA_FLASH_ATTENTION"] = "1"
+ollama_env["OLLAMA_KV_CACHE_TYPE"] = "q8_0" # Another 2026 speed optimization
 
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 PDF_PATH = os.environ.get("PDF_PATH", "AI Module.pdf")
-CHUNK_SIZE = 1024
-OVERLAP_SIZE = 200
+CHUNK_SIZE = 250
+OVERLAP_SIZE = 50
 EMBED_MODEL = "nomic-embed-text:latest"
-THINKING_MODEL = "llama3.1:latest"
+THINKING_MODEL = "gemma3:1b"
+HYDE_MODEL = "gemma3:1b"
 BATCH_SIZE = 32
-TOP_K = 2
+TOP_K = 3
 STREAM = True
 KEEP_ALIVE = '1h'
 DB_FOLDER = "db"
@@ -34,11 +43,54 @@ RERANK_MODEL = "ms-marco-MiniLM-L-12-v2" # https://huggingface.co/prithivida/fla
 CACHE_DIR = "./model_cache"
 TEMP_PATH = "./temp"
 MAX_SENTENCES = 8
+MAX_TOKENS = 250
+OVERLAP_TOKENS = 50
+TOKENIZER_CACHE = "tokenizer_cache"
+FAISS_NEAREST_K = 12
+
+_ollama_process = None
+
+def is_ollama_running():
+    try:
+        ollama.list()
+        return True
+    except Exception:
+        return False
+
+def start_ollama_server():
+    global _ollama_process
+    if is_ollama_running(): return True
+    try:
+        env = os.environ.copy()
+        env["OLLAMA_FLASH_ATTENTION"] = "1"
+        _ollama_process = subprocess.Popen(
+            ['ollama', 'serve'], env=env,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        for i in range(20):
+            if is_ollama_running():
+                logger.info("Ollama started successfully.")
+                return True
+            time.sleep(1)
+        return False
+    except Exception as e:
+        logger.error(f"Ollama startup error: {e}")
+        return False
+
+def cleanup_ollama():
+    if _ollama_process:
+        _ollama_process.terminate()
+        logger.info("Ollama process terminated.")
+
+TIKTOKEN_CACHE_DIR = os.path.join(os.getcwd(), TOKENIZER_CACHE)
+if not os.path.exists(TIKTOKEN_CACHE_DIR):
+    os.makedirs(TIKTOKEN_CACHE_DIR)
+os.environ["TIKTOKEN_CACHE_DIR"] = TIKTOKEN_CACHE_DIR
 
 # https://github.com/PrithivirajDamodaran/FlashRank
 
 def readpdf(pdf_file):
-    print(f"Reading PDF: {pdf_file}")
+    logger.info(f"Reading PDF: {pdf_file}")
     all_texts = []
 
     try:
@@ -49,10 +101,10 @@ def readpdf(pdf_file):
                     continue
                 all_texts.append((i + 1, text))
     except FileNotFoundError:
-        print(f"PDF not found: {pdf_file}")
+        logger.error(f"PDF not found: {pdf_file}")
         sys.exit(1)
     except Exception as exc:
-        print(f"Failed to read PDF: {exc}")
+        logger.error(f"Failed to read PDF: {exc}")
         sys.exit(1)
 
     return all_texts
@@ -64,123 +116,80 @@ def get_safe_threads():
     return max(1, cores - 2)
 
 st.set_page_config(page_title="Chat PDF", layout="wide")
+if not is_ollama_running():
+    with st.spinner("Initializing Ollama..."):
+        if not start_ollama_server():
+            st.error("Failed to start Ollama."); st.stop()
+        atexit.register(cleanup_ollama)
+tokenizer = tiktoken.get_encoding("cl100k_base")
 
-def generate_chunks(text, page_num):
-    if not text:
-        return []
-
-    chunks = []
-    i = 0
-    while i < len(text):
-        end = min(i + CHUNK_SIZE, len(text))
-        chunk = text[i:end]
-
-        if end < len(text):
-            last_space = chunk.rfind(" ")
-            if last_space != -1:
-                end = i + last_space
-                chunk = text[i:end]
-
-        chunk = chunk.strip()
-        if chunk:
-            chunks.append({"text": chunk, "page": page_num})
-
-        i = end - OVERLAP_SIZE
-        if i < 0:
-            i = 0
-        if i >= len(text) or end == len(text):
-            break
-
-    return chunks
-
-def generate_chunks_recursive(text, page_num, chunk_size, overlap_size):
-    if not text: return []
-    chunks = []
-    start = 0
-    min_chunk_size = 100  # Avoid tiny chunks at the end of pages
-
-    while start < len(text):
-        end = start + chunk_size
-
-        if end >= len(text):
-            chunk_text = text[start:].strip()
-            if chunk_text: chunks.append({"text": chunk_text, "page": page_num})
-            break
-
-        chunk_slice = text[start:end]
-
-        for separator in ["\n\n", "\n", ". ", " "]:
-            last_break = chunk_slice.rfind(separator)
-            if last_break != -1:
-                if separator == ". ": last_break += 1
-                break
-        else:
-            last_break = chunk_size
-
-        actual_end = start + last_break
-        final_chunk = text[start:actual_end].strip()
-
-        if len(final_chunk) > min_chunk_size:
-            chunks.append({"text": final_chunk, "page": page_num})
-            start = actual_end - overlap_size
-        else:
-            start = actual_end
-
-    return chunks
+def get_token_length(text):
+    return len(tokenizer.encode(text))
 
 def generate_advanced_chunks(page_content,page_num):
-    search_chunks = generate_chunks_recursive(page_content,page_num,CHUNK_SIZE,OVERLAP_SIZE)
-
+    search_chunks = generate_chunks_recursive_tokens(page_content,page_num)
+    # search_chunks = generate_chunks_recursive(page_content, page_num, 1024,200)
     for chunk in search_chunks:
         chunk["text"] = f"[Page {page_num}] {chunk['text']}"
         chunk["full_context"] = page_content
 
     return search_chunks
 
+def generate_chunks_recursive_tokens(text,page_num):
+    if not text: 
+        logger.debug(f"Empty text provided for page {page_num}")
+        return []
+    chunks = []
+    paragraphs = text.split("\n\n")
+    logger.debug(f"Page {page_num}: Split into {len(paragraphs)} paragraphs")
+    current_chunk = []
+    current_tokens=0
+
+    for paragraph in paragraphs:
+        paragraph_tokens = get_token_length(paragraph)
+        if paragraph_tokens > MAX_TOKENS:
+            sentences=re.split(r'(?<=[.!?]) +', paragraph)
+            for sentence in sentences:
+                sentence_token = get_token_length(sentence)
+                if current_tokens + sentence_token > MAX_TOKENS:
+                    chunk_text = " ".join(current_chunk)
+                    chunks.append({"text": chunk_text, "page": page_num})
+                    current_chunk = current_chunk[-2:] if len(current_chunk) > 2 else []
+                    current_tokens=sum(get_token_length(cur_chunk) for cur_chunk in current_chunk)
+                current_chunk.append(sentence)
+                current_tokens+=sentence_token
+        else:
+            if current_tokens + paragraph_tokens > MAX_TOKENS:
+                chunk_text = "\n\n".join(current_chunk)
+                chunks.append({"text": chunk_text, "page": page_num})
+                current_chunk=[]
+                current_tokens=0
+            current_chunk.append(paragraph)
+            current_tokens+=paragraph_tokens
+
+    if current_chunk:
+        chunks.append({"text": "\n\n".join(current_chunk), "page": page_num})
+
+    logger.debug(f"Page {page_num}: Created {len(chunks)} chunks from {len(paragraphs)} paragraphs")
+    return chunks
+
 def generate_embeddings_batch(texts):
     all_embeddings = []
-    for i in range(0, len(texts), BATCH_SIZE):
+    total_batches = (len(texts) + BATCH_SIZE - 1) // BATCH_SIZE
+    logger.info(f"Starting embeddings batch processing for {len(texts)} texts in {total_batches} batches (batch size: {BATCH_SIZE})")
+    
+    for batch_idx, i in enumerate(range(0, len(texts), BATCH_SIZE), 1):
         batch_texts = texts[i:i+BATCH_SIZE]
         try:
+            logger.debug(f"Processing batch {batch_idx}/{total_batches} with {len(batch_texts)} texts")
             response = ollama.embed(model=EMBED_MODEL, input=batch_texts)
+            all_embeddings.extend(response["embeddings"])
         except Exception as exc:
+            logger.error(f"Embedding request failed for batch {batch_idx}: {exc}")
             raise RuntimeError(f"Embedding request failed: {exc}") from exc
-        all_embeddings.extend(response["embeddings"])
+    
+    logger.info(f"Completed embedding generation: {len(all_embeddings)} embeddings created")
     return all_embeddings
-
-def search_numpy(query, vector_db, text_metadata):
-    query = query.strip()
-    if not query:
-        return []
-
-    response = ollama.embed(model=EMBED_MODEL, input=query)
-    query_embedding = response["embeddings"][0]
-    query_vector = np.array(query_embedding, dtype=np.float32)
-
-    start_time = time.perf_counter()
-    similarities = np.dot(vector_db, query_vector)
-    top_indices = np.argsort(similarities)[-TOP_K:][::-1]
-
-    end_time = time.perf_counter()
-    execution_time = end_time - start_time
-    print(f"Total time with numpy: {execution_time}")
-    return [text_metadata[i] for i in top_indices]
-
-def search_faiss(query, index, text_metadata):
-    query = query.strip()
-    if not query:
-        return []
-
-    response = ollama.embed(model=EMBED_MODEL, input=query)
-    query_embedding = response["embeddings"][0]
-    query_vector = np.array(query_embedding, dtype=np.float32)
-
-    start_time = time.perf_counter()
-    distances,indices = index.search(query_vector.reshape(1,-1), k=TOP_K)
-    end_time = time.perf_counter()
-    execution_time = end_time - start_time
-    print(f"Total time with FAISS: {execution_time}")
-    return [text_metadata[i] for i in indices[0]]
 
 def generate_answer(query, results, chat_history,threads,temp):
     options = {
@@ -189,32 +198,57 @@ def generate_answer(query, results, chat_history,threads,temp):
         # "num_ctx": 8192  # Limits context window to keep it fast
     }
 
-    raw_context_tokens = sum(estimate_tokens(res['full_context']) for res in results)
+    raw_context_tokens = sum(get_token_length(res['full_context']) for res in results)
+    logger.debug(f"Query: {query[:100]}..." if len(query) > 100 else f"Query: {query}")
+    page_match = re.search(r"page\s+(\d+)", query.lower())
+
     context_parts = []
+    for res in results:
+        # If user asked for a specific page, send the WHOLE page content
+        # Otherwise, use the keyword compression for general questions
+        if page_match:
+            compressed_text = res['full_context']
+        else:
+            compressed_text = compress_context(query, res['full_context'])
+
+        context_parts.append(
+            f"--- START OF PAGE {res['page']} ---\n{compressed_text}\n--- END OF PAGE {res['page']} ---")
     for res in results:
         compressed_text = compress_context(query, res['full_context'])
         context_parts.append(
             f"--- START OF PAGE {res['page']} ---\n{compressed_text}\n--- END OF PAGE {res['page']} ---")
 
     compressed_context_text = "\n\n".join(context_parts).strip()
-    compressed_tokens = estimate_tokens(compressed_context_text)
+    compressed_tokens = get_token_length(compressed_context_text)
 
     stats = {
         "raw_tokens": raw_context_tokens,
         "compressed_tokens": compressed_tokens,
         "saved_tokens": raw_context_tokens - compressed_tokens
     }
+    logger.debug(f"Token compression stats - Raw: {raw_context_tokens}, Compressed: {compressed_tokens}, Saved: {stats['saved_tokens']} ({100*stats['saved_tokens']/raw_context_tokens if raw_context_tokens > 0 else 0:.1f}%)")
 
     history_text = "\n".join([f"{history['role']}: {history['content']}" for history in chat_history[-5:]])
 
     context_text = "\n\n".join(context_parts).strip()
+
     prompt = f"""
-You are a professional research assistant. Use the provided context to answer the question accurately.
+You are a professional research assistant. 
+Review the ENTIRE context provided below and provide a comprehensive, 
+detailed response covering all sections mentioned.
+
+STRICT RULE: Your answer MUST be based ONLY on the provided Context. 
+Do NOT use outside knowledge. 
+If the information is not in the Context, say "I don't know based on this page."
 
 Instructions:
 1. Every time you state a fact from the context, cite the page number immediately after the sentence in brackets, like this: [Page X].
 2. If the answer isn't in the context, clearly state that you don't know.
 3. Keep your response structured and easy to read.
+
+IMPORTANT:
+If the question asks about a specific page, ONLY use content from that page, previous page and next page.
+Ignore all other pages.
 
 Context:
 {context_text}
@@ -238,35 +272,12 @@ Answer:
     # response = ollama.generate(model=THINKING_MODEL, prompt=prompt, keep_alive=KEEP_ALIVE)
     # return response["response"],stats
 
-def chat_pdf(index, text_metadata):
-    while True:
-        user_query = input("You - ").strip()
-        if not user_query:
-            continue
-        if user_query.lower() in {"exit", "quit"}:
-            break
-
-        # results = search(user_query, vector_db, text_metadata)
-
-        # results = search_faiss(user_query, index, text_metadata)
-        results = search_with_rerank(user_query, index, text_metadata)
-        # results1 = search_numpy(user_query, vector_db, text_metadata)
-        if not results:
-            print("No relevant content found for that query.")
-            continue
-
-        context_llm = [res["text"] for res in results]
-        print("--- Response ---")
-        if STREAM:
-            for chunk in generate_answer(user_query, context_llm):
-                print(chunk['response'], end='', flush=True)
-            print("\n")  # New line after the full response is finished
-        else:
-            response = generate_answer(user_query, context_llm)
-            print(f"{response}\n")
-
-        pages = sorted({res["page"] for res in results})
-        print(f"Sources: [Page {', '.join(map(str, pages))}]\n")
+def generate_hypothetical_answer(query):
+    """HyDE: Generates a brief fake answer to improve vector search."""
+    prompt = f"Write a 2-sentence technical summary answering: {query}"
+    # Use a fast call to Ollama (non-streaming for speed)
+    response = ollama.generate(model=HYDE_MODEL, prompt=prompt, stream=False)
+    return response['response']
 
 def verify_normalized_embedding(embeddings):
     """
@@ -281,25 +292,29 @@ def verify_normalized_embedding(embeddings):
 
     all_normalized = np.all(np.isclose(norms, 1.0))
 
-    print(f"Vector Magnitude: {norms}")
+    logger.debug(f"Vector Magnitude: {norms}")
 
     if all_normalized:
-        print("The embedding is L2 normalized.")
+        logger.info("The embedding is L2 normalized.")
     else:
-        print("The embedding is NOT normalized.")
+        logger.warning("The embedding is NOT normalized.")
 
 def check_ollama_status():
     try:
         response = ollama.list()
         # downloaded_models=[model.get("model") for model in response.get("models",[])]
         downloaded_models = [m.model for m in response.models]
+        logger.debug(f"Available Ollama models: {downloaded_models}")
         is_model_missing = [model for model in [EMBED_MODEL,THINKING_MODEL] if model not in downloaded_models]
 
         if not is_model_missing:
+            logger.info(f"All required models available: {[EMBED_MODEL, THINKING_MODEL]}")
             return True
         else:
+            logger.warning(f"Missing models: {is_model_missing}")
             return False
     except Exception as exc:
+        logger.error(f"Failed to check Ollama status: {exc}")
         return False
 
 def save_vector_db(index,metadata,current_hash):
@@ -309,68 +324,118 @@ def save_vector_db(index,metadata,current_hash):
     data = {"metadata": metadata,"pdf_hash": current_hash}
     with open(os.path.join(DB_FOLDER, "metadata.pkl"), "wb") as f:
         pickle.dump(data, f)
-    print("Saved vector database and PDF Hash value.")
+    logger.info("Saved vector database and PDF Hash value.")
 
 def load_vector_db():
     if os.path.exists(DB_FOLDER):
         index = faiss.read_index(os.path.join(DB_FOLDER, "index.faiss"))
         with open(f"{DB_FOLDER}/metadata.pkl", "rb") as f:
             data = pickle.load(f)
-        print("Database loaded successfully.")
+        logger.info("Database loaded successfully.")
         return index, data.get("metadata"), data.get("pdf_hash")
     return None, None, None
 
 def calculate_pdf_hash(pdf_file):
+    logger.debug(f"Calculating hash for PDF: {pdf_file}")
     sha256_hash = hashlib.sha256()
-    with open (pdf_file, "rb") as f:
-        for byte_block in iter(lambda: f.read(4096), b""):
-            sha256_hash.update(byte_block)
-    return sha256_hash.hexdigest()
+    try:
+        with open (pdf_file, "rb") as f:
+            for byte_block in iter(lambda: f.read(4096), b""):
+                sha256_hash.update(byte_block)
+        hash_value = sha256_hash.hexdigest()
+        logger.debug(f"PDF hash calculated: {hash_value}")
+        return hash_value
+    except Exception as exc:
+        logger.error(f"Failed to calculate PDF hash: {exc}")
+        raise
 
 @st.cache_resource
 def get_ranker():
     return Ranker(model_name=RERANK_MODEL,cache_dir=CACHE_DIR)
 
-def search_with_rerank(query,index,text_metadata):
+
+def search_with_rerank(query, index, text_metadata):
     ranker = get_ranker()
     query = query.strip()
     if not query:
+        logger.warning("Empty query provided to search_with_rerank")
         return []
 
     page_match = re.search(r"page\s+(\d+)", query.lower())
     target_page = int(page_match.group(1)) if page_match else None
-    response = ollama.embed(model=EMBED_MODEL, input=query)
-
-    query_embedding = response["embeddings"][0]
-    query_vector = np.array(query_embedding, dtype=np.float32)
-    start_time = time.perf_counter()
-    distances,indices = index.search(query_vector.reshape(1,-1), k=10)
-    end_time = time.perf_counter()
-    execution_time = end_time - start_time
-
-    candidates = [text_metadata[i] for i in indices[0]]
 
     if target_page:
-        page_specific_chunks = [_text for _text in text_metadata if _text["page"] == target_page]
-        candidates = page_specific_chunks[:3] + candidates
+        start_time = time.perf_counter()
+
+        # Strict filtering (no semantic noise)
+        candidates = [
+            item for item in text_metadata
+            if item["page"] == target_page
+        ]
+
+        if not candidates:
+            logger.warning(f"No candidates found for page {target_page}")
+            return []
+
+        # Prepare reranker input
+        rerank_items = [
+            {
+                "id": i,
+                "text": c["text"],
+                "page": c["page"],
+                "full_context": c.get("full_context", "")
+            }
+            for i, c in enumerate(candidates)
+        ]
+
+        rerank_request = RerankRequest(query=query, passages=rerank_items)
+        results = ranker.rerank(rerank_request)
+
+        end_time = time.perf_counter()
+        logger.info(f"[PAGE MODE] Page {target_page} | Time: {end_time - start_time:.2f}s")
+
+        return results  # return full page context
+
+    start_time = time.perf_counter()
+
+    # HyDE (only for semantic queries)
+    hypothetical_answer = generate_hypothetical_answer(query)
+    search_query = f"{query} {hypothetical_answer}"
+
+    # Embedding
+    response = ollama.embed(model=EMBED_MODEL, input=search_query)
+    query_vector = np.array(response["embeddings"][0], dtype=np.float32)
+
+    faiss_start = time.perf_counter()
+    distances, indices = index.search(query_vector.reshape(1, -1), k=FAISS_NEAREST_K)
+    faiss_end = time.perf_counter()
+
+    candidates = [text_metadata[i] for i in indices[0]]
 
     rerank_items = [
         {
             "id": i,
-            "text": candidate["text"],
-            "page": candidate["page"],
-            "full_context": candidate.get("full_context", "")  # Add this line
+            "text": c["text"],
+            "page": c["page"],
+            "full_context": c.get("full_context", "")
         }
-        for i, candidate in enumerate(candidates)
+        for i, c in enumerate(candidates)
     ]
-    rerank_request = RerankRequest(query=query,passages=rerank_items)
+
+    rerank_request = RerankRequest(query=query, passages=rerank_items)
     results = ranker.rerank(rerank_request)
-    print(f"Total time with FAISS: {execution_time}")
-    print("\n--- Re-ranker Scores ---")
+
+    end_time = time.perf_counter()
+
+    logger.info(f"[SEMANTIC MODE] Total Time: {end_time - start_time:.2f}s")
+    logger.debug(f"  → FAISS Time: {faiss_end - faiss_start:.2f}s")
+    logger.debug(f"  → Candidates: {len(candidates)}")
+
+    logger.debug("\n--- Re-ranker Scores ---")
     for i, res in enumerate(results[:TOP_K]):
-        # FlashRank provides a 'score' key
-        print(f"Rank {i + 1}: Score {res['score']:.4f} (Page {res['page']})")
-    print("------------------------\n")
+        logger.debug(f"Rank {i+1}: Score {res['score']:.4f} (Page {res['page']})")
+    logger.debug("------------------------\n")
+
     return results[:TOP_K]
 
 def compress_context(query, full_text):
@@ -379,160 +444,182 @@ def compress_context(query, full_text):
     query_words = set(query.lower().split())
 
     scored_sentences = []
-    for s in sentences:
-        # Score sentence based on keyword overlap with query
+    for i,s in enumerate(sentences):
         score = sum(1 for word in s.lower().split() if word in query_words)
-        scored_sentences.append((score, s))
+        scored_sentences.append((score,i , s))
 
-    # Sort by score and take the top sentences, then re-sort by original order
     top_sentences = sorted(scored_sentences, key=lambda x: x[0], reverse=True)[:MAX_SENTENCES]
-    # Re-sort to maintain document flow
-    compressed = " ".join([s for _, s in top_sentences])
+    top_sentences = sorted(top_sentences, key=lambda x:x[1])
+    compressed = " ".join([s for _,_, s in top_sentences])
 
     return compressed if compressed else full_text[:1000]  # Fallback to snippet
 
-def estimate_tokens(text):
-    # Standard approximation: 1 token ≈ 4 characters or 0.75 words
-    return len(text) // 4
-
 def build_pipeline(pdf_file):
+    logger.info(f"=" * 60)
+    logger.info(f"Starting pipeline for PDF: {pdf_file}")
+    logger.info(f"=" * 60)
+    
     if not check_ollama_status():
-        print("Please start Ollama or run 'ollama pull <model_name>' for missing models.")
+        logger.error("Please start Ollama or run 'ollama pull <model_name>' for missing models.")
         st.warning("Please start Ollama or run 'ollama pull <model_name>' for missing models.")
         sys.exit(1)
 
+    logger.info("Step 1: Calculating PDF hash...")
     current_hash = calculate_pdf_hash(pdf_file)
+    
+    logger.info("Step 2: Attempting to load existing vector database...")
     index, metadata,stored_hash = load_vector_db()
 
     if index and metadata and current_hash == stored_hash and not OVERRIDE_DB:
+        logger.info(f"Hash match found (stored: {stored_hash[:16]}...). Using existing database.")
         st.info("Existing database found for this file. Loading...")
         return index, metadata
 
+    logger.info("Hash mismatch or no existing database. Processing new PDF...")
     st.info("New PDF detected. Processing...")
+    
+    logger.info("Step 3: Reading PDF...")
     texts = readpdf(pdf_file)
     if not texts:
-        print("No text found in PDF.")
+        logger.error("No text found in PDF.")
         st.warning("No text found in PDF.")
         sys.exit(1)
 
+    logger.info(f"Step 4: Creating chunks from {len(texts)} pages...")
     metadata = []
     for page_num, page_content in texts:
         metadata.extend(generate_advanced_chunks(page_content, page_num))
 
     if not metadata:
-        print("No content chunks were created from the PDF.")
+        logger.error("No content chunks were created from the PDF.")
         st.warning("No content chunks were created from the PDF.")
         sys.exit(1)
 
+    logger.info(f"Step 5: Generating embeddings for {len(metadata)} chunks...")
     text_data = [item["text"] for item in metadata]
     vectors = generate_embeddings_batch(text_data)
     verify_normalized_embedding(vectors)
 
     vector_np = np.array(vectors).astype('float32')
 
+    logger.info(f"Step 6: Building FAISS index with dimension {vector_np.shape[1]}...")
     dimension = vector_np.shape[1]
     index = faiss.IndexFlatIP(dimension)
     index.add(vector_np)
+    logger.info(f"FAISS index built with {index.ntotal} vectors")
 
+    logger.info("Step 7: Saving vector database...")
     save_vector_db(index, metadata, current_hash)
+    
+    logger.info(f"=" * 60)
+    logger.info(f"Pipeline completed successfully!")
+    logger.info(f"Total chunks: {len(metadata)}, Total vectors: {index.ntotal}")
+    logger.info(f"=" * 60)
 
     return index, metadata
 
+def get_ollama_models():
+    try:
+        response = ollama.list()
+        models_list=[]
+        for model in response.models:
+            models_list.append(model.model)
+        logger.debug(f"Retrieved {len(models_list)} available Ollama models")
+        return models_list
+    except Exception as exc:
+        logger.error(f"Failed to retrieve Ollama models: {exc}")
+        return []
 
-# if __name__ == '__main__':
-#     print('Welcome to Chat with PDF.')
-#     index,metadata=build_pipeline(PDF_PATH)
-#     chat_pdf(index, metadata)
+def main():
+    with st.sidebar:
+        st.title("Document Settings")
+        uploaded_file = st.sidebar.file_uploader("Choose a PDF file", type=["pdf"])
+        if uploaded_file:
+            tmp_path = os.path.join(TEMP_PATH, uploaded_file.name)
+            if not os.path.exists(TEMP_PATH): os.mkdir(TEMP_PATH)
 
-with st.sidebar:
-    st.title("Document Settings")
-    uploaded_file = st.sidebar.file_uploader("Choose a PDF file", type=["pdf"])
-    if uploaded_file:
-        tmp_path = os.path.join(TEMP_PATH, uploaded_file.name)
-        if not os.path.exists(TEMP_PATH): os.mkdir(TEMP_PATH)
+            with open(tmp_path, "wb") as f:
+                f.write(uploaded_file.getbuffer())
+            st.sidebar.success(f"Uploaded: {uploaded_file.name}")
 
-        with open(tmp_path, "wb") as f:
-            f.write(uploaded_file.getbuffer())
-        st.sidebar.success(f"Uploaded: {uploaded_file.name}")
+            if st.button("Index & Start"):
+                with st.spinner(text="Analyzing document...", show_time=True):
+                    idx, metadata = build_pipeline(tmp_path)
+                    st.session_state.index = idx
+                    st.session_state.metadata = metadata
+                    st.success(f"Ready to Chat!")
 
-        if st.button("Index & Start"):
-            with st.spinner(text="Analyzing document...",show_time=True):
-                idx,metadata=build_pipeline(tmp_path)
-                st.session_state.index = idx
-                st.session_state.metadata = metadata
-                st.success(f"Ready to Chat!")
+            if st.button("🗑️ Clear Chat History"):
+                st.session_state.messages = []
+                st.rerun()
 
-        if st.button("🗑️ Clear Chat History"):
-            st.session_state.messages = []
-            st.rerun()
+            option = st.selectbox("Choose an option:", get_ollama_models())
+            st.write("You selected:", option)
+            THINKING_MODEL = option
 
-        st.subheader("⚙️ Performance Tuning")
-        user_threads = st.slider("CPU Threads", 1, psutil.cpu_count(), get_safe_threads())
-        use_flash = st.toggle("Flash Attention", value=True)
-        temperature = st.slider("Creativity (Temp)", 0.0, 1.0, 0.1)
+            st.subheader("⚙️ Performance Tuning")
+            user_threads = st.slider("CPU Threads", 1, psutil.cpu_count(), get_safe_threads())
+            use_flash = st.toggle("Flash Attention", value=True)
+            temperature = st.slider("Creativity (Temp)", 0.0, 1.0, 0.1)
 
-st.title("Chat with your PDF")
+    st.title("Chat with your PDF")
 
-if "messages" not in st.session_state:
-    st.session_state.messages = []
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
 
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
 
-if prompt := st.chat_input("Ask something about the PDF..."):
-    if "index" not in st.session_state:
-        st.error("Please upload and index a PDF first!")
-    else:
-        st.session_state.messages.append({"role": "user", "content": prompt})
-        with st.chat_message("user"):
-            st.markdown(prompt)
+    if prompt := st.chat_input("Ask something about the PDF..."):
+        if "index" not in st.session_state:
+            st.error("Please upload and index a PDF first!")
+        else:
+            st.session_state.messages.append({"role": "user", "content": prompt})
+            with st.chat_message("user"):
+                st.markdown(prompt)
 
-        with st.chat_message("assistant"):
-            response_placeholder=st.empty()
-            full_response = ""
+            with st.chat_message("assistant"):
+                response_placeholder = st.empty()
+                full_response = ""
 
-            results = search_with_rerank(prompt, st.session_state.index, st.session_state.metadata)
+                # better for page specific questions like "what is on page 3".
+                # issues starts from historical data, hence removed
+                # optimize latter
 
-            start_gen = time.perf_counter()
+                # new_page_match = re.search(r"page\s+(\d+)", prompt.lower())
+                # if new_page_match:
+                #     st.session_state.current_page = int(new_page_match.group(1))
+                # current_page = st.session_state.get("current_page")
+                # results = search_with_rerank(prompt, st.session_state.index, st.session_state.metadata,forced_page=current_page)
 
-            stream_response,stats = generate_answer(prompt, results, st.session_state.messages,user_threads,temperature)
+                results = search_with_rerank(prompt, st.session_state.index, st.session_state.metadata)
 
-            for chunk in stream_response:
-                full_response += chunk['response']
-                response_placeholder.markdown(full_response + "▌")
+                start_gen = time.perf_counter()
 
-            end_gen = time.perf_counter()
-            gen_time = end_gen - start_gen
+                stream_response, stats = generate_answer(prompt, results, st.session_state.messages, user_threads,
+                                                         temperature)
 
-            col1, col2, col3 = st.columns(3)
-            col1.metric("Time Taken", f"{gen_time:.2f}s")
-            col2.metric("Tokens Used", f"{stats['compressed_tokens']}")
-            col3.metric("Tokens Saved", f"{stats['saved_tokens']}", delta_color="normal")
+                for chunk in stream_response:
+                    full_response += chunk['response']
+                    response_placeholder.markdown(full_response + "▌")
 
-            # for chunk in generate_answer(prompt, results, st.session_state.messages):
-            #     full_response += chunk['response']
-            #     response_placeholder.markdown(full_response + "▌")
+                end_gen = time.perf_counter()
+                gen_time = end_gen - start_gen
 
-            response_placeholder.markdown(full_response)
+                col1, col2, col3 = st.columns(3)
+                col1.metric("Time Taken", f"{gen_time:.2f}s")
+                col2.metric("Tokens Used", f"{stats['compressed_tokens']}")
+                # col3.metric("Tokens Saved", f"{stats['saved_tokens']}", delta_color="normal")
 
-            pages = sorted({res["page"] for res in results})
-            st.caption(f"Sources: Pages {', '.join(map(str, pages))}")
+                response_placeholder.markdown(full_response)
 
-        st.session_state.messages.append({"role": "assistant", "content": full_response})
+                pages = sorted({res["page"] for res in results})
+                st.caption(f"Sources: Pages {', '.join(map(str, pages))}")
 
-    # vector_db = np.array(vectors, dtype=np.float32)
-    # text_metadata = all_metadata
-    # chat_pdf(index,vector_db, text_metadata)
+            st.session_state.messages.append({"role": "assistant", "content": full_response})
 
-    # user_query = "What is the main topic of the PDF?"
-    # user_query = "What does this mention about Heuristic based search?"
-    # user_query="What is explanation facility? Explain with any examples provided by PDF."
-    # user_query="Is anything mentioned as Knowledge representation and inference, and any examples provided for it?"
-    # user_query="What is the main topic of the PDF? What are the subtopics covered in it?"
-    # user_query="Explain in detail about Heuristic based search" # failing question
-    # results = search(user_query, vector_db, text_metadata)
-    #
-    # response = generate_answer(user_query, chunks)
-    # print(f"--- Query ---\n{user_query}\n")
-    # print(f"--- Response ---\n{response}\n")
+if __name__ == '__main__':
+    logger.info('Welcome to Chat with PDF.')
+    main()
+
