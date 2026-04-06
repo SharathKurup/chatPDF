@@ -115,7 +115,12 @@ def get_safe_threads():
     cores = psutil.cpu_count(logical=True)
     return max(1, cores - 2)
 
-st.set_page_config(page_title="Chat PDF", layout="wide")
+st.set_page_config(
+    page_title="Chat PDF - AI Document Assistant",
+    page_icon="📚",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 if not is_ollama_running():
     with st.spinner("Initializing Ollama..."):
         if not start_ollama_server():
@@ -532,6 +537,46 @@ def get_ollama_models():
         return [DEFAULT_THINKING_MODEL]
 
 def main():
+    # Custom CSS for better styling
+    st.markdown("""
+    <style>
+    .stApp {
+        background: linear-gradient(135deg, #1e3c72 0%, #2a5298 100%);
+        color: white;
+    }
+    .main .block-container {
+        background: rgba(30, 30, 30, 0.95);
+        color: white;
+        border-radius: 10px;
+        padding: 2rem;
+        margin: 1rem auto;
+        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.3);
+    }
+    .stSidebar {
+        background: rgba(30, 30, 30, 0.95);
+        color: white;
+        border-radius: 10px;
+        margin: 1rem;
+        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.3);
+    }
+    .stChatMessage {
+        border-radius: 10px;
+        margin: 0.5rem 0;
+        padding: 1rem;
+        background: rgba(45, 45, 45, 0.8) !important;
+    }
+    .stMetric {
+        background: rgba(45, 45, 45, 0.8);
+        border-radius: 8px;
+        padding: 0.5rem;
+        box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
+    }
+    .stButton>button {
+        border-radius: 10px;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
     if "user_threads" not in st.session_state:
         st.session_state.user_threads = get_safe_threads()
     if "temperature" not in st.session_state:
@@ -540,110 +585,337 @@ def main():
         st.session_state.thinking_model = DEFAULT_THINKING_MODEL
     if "messages" not in st.session_state:
         st.session_state.messages = []
+    if "uploaded_file_name" not in st.session_state:
+        st.session_state.uploaded_file_name = None
+    if "index" not in st.session_state:
+        st.session_state.index = None
+    if "metadata" not in st.session_state:
+        st.session_state.metadata = None
 
     with st.sidebar:
-        st.title("Document Settings")
-        uploaded_file = st.sidebar.file_uploader("Choose a PDF file", type=["pdf"])
+        st.title("Document Assistant")
+
+        st.markdown("---")
+
+        # File Upload Section
+        st.subheader("Document Upload")
+        uploaded_file = st.sidebar.file_uploader(
+            "Choose a PDF file",
+            type=["pdf"],
+            help="Upload a PDF document to start chatting with it"
+        )
+
         if uploaded_file:
+            # Reset chat when a new file is selected
+            if st.session_state.uploaded_file_name != uploaded_file.name:
+                st.session_state.messages = []
+                st.session_state.index = None
+                st.session_state.metadata = None
+                st.session_state.uploaded_file_name = uploaded_file.name
+
+            # File info display
+            file_size = len(uploaded_file.getbuffer()) / 1024 / 1024  # MB
+            st.success(f"📎 **{uploaded_file.name}** ({file_size:.1f} MB)")
+
             tmp_path = os.path.join(TEMP_PATH, uploaded_file.name)
             if not os.path.exists(TEMP_PATH): os.mkdir(TEMP_PATH)
 
             with open(tmp_path, "wb") as f:
                 f.write(uploaded_file.getbuffer())
-            st.sidebar.success(f"Uploaded: {uploaded_file.name}")
 
-            if st.button("Index & Start"):
-                with st.spinner(text="Analyzing document...", show_time=True):
-                    idx, metadata = build_pipeline(tmp_path,st.session_state.thinking_model)
+            # Action buttons in columns
+            index_requested = False
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("🚀 Index & Start", use_container_width=True):
+                    index_requested = True
+
+            with col2:
+                if st.button("🗑️ Clear History", use_container_width=True):
+                    st.session_state.messages = []
+                    st.rerun()
+
+            if index_requested:
+                with st.spinner("🔄 Analyzing document..."):
+                    progress_bar = st.progress(0)
+                    st.text("Step 1/7: Checking models...")
+                    progress_bar.progress(14)
+
+                    st.text("Step 2/7: Calculating hash...")
+                    progress_bar.progress(28)
+
+                    st.text("Step 3/7: Reading PDF...")
+                    progress_bar.progress(42)
+
+                    st.text("Step 4/7: Creating chunks...")
+                    progress_bar.progress(56)
+
+                    st.text("Step 5/7: Generating embeddings...")
+                    progress_bar.progress(70)
+
+                    st.text("Step 6/7: Building index...")
+                    progress_bar.progress(84)
+
+                    st.text("Step 7/7: Saving database...")
+                    progress_bar.progress(100)
+
+                    # Reset conversation when indexing a document
+                    st.session_state.messages = []
+                    idx, metadata = build_pipeline(tmp_path, st.session_state.thinking_model)
                     st.session_state.index = idx
                     st.session_state.metadata = metadata
-                    st.success(f"Ready to Chat!")
+                    progress_bar.empty()
 
-            if st.button("🗑️ Clear Chat History"):
-                st.session_state.messages = []
-                st.rerun()
+                st.success("✅ Ready to Chat!")
 
+            st.markdown("---")
+
+            # Model Selection
+            st.subheader("AI Model")
             available_models = get_ollama_models()
-            st.session_state.thinking_model = st.selectbox(
+            current_model = st.session_state.get('thinking_model', DEFAULT_THINKING_MODEL)
+
+            # Find current model index, default to first if not found
+            try:
+                current_idx = available_models.index(current_model)
+            except ValueError:
+                current_idx = 0
+                if available_models:
+                    st.session_state.thinking_model = available_models[0]
+
+            selected_model = st.selectbox(
                 "Choose model:",
-                available_models,
-                index=available_models.index(st.session_state.thinking_model) if st.session_state.thinking_model in available_models else 0
+                available_models if available_models else [DEFAULT_THINKING_MODEL],
+                index=current_idx,
+                help="Select the AI model for generating responses"
             )
+            st.session_state.thinking_model = selected_model
 
-            st.subheader("⚙️ Performance Tuning")
+            # Performance Settings
+            st.markdown("---")
+            st.subheader("Performance Tuning")
+
+            # CPU Threads
+            max_threads = psutil.cpu_count()
+            safe_threads = get_safe_threads()
             st.session_state.user_threads = st.slider(
-                "CPU Threads", 
-                1, 
-                psutil.cpu_count(), 
-                st.session_state.user_threads
+                "CPU Threads",
+                min_value=1,
+                max_value=max_threads,
+                value=st.session_state.user_threads,
+                help=f"Recommended: {safe_threads} (keeps system responsive)"
             )
+
+            # Temperature
             st.session_state.temperature = st.slider(
-                "Creativity (Temp)", 
-                0.0, 
-                1.0, 
-                st.session_state.temperature
+                "Creativity (Temperature)",
+                min_value=0.0,
+                max_value=1.0,
+                value=st.session_state.temperature,
+                step=0.1,
+                help="Lower = more focused, Higher = more creative"
             )
 
+            # System Info
+            st.markdown("---")
+            st.subheader("System Info")
+            col_a, col_b = st.columns(2)
+            with col_a:
+                st.metric("CPU Cores", f"{max_threads}")
+            with col_b:
+                st.metric("Safe Threads", f"{safe_threads}")
+
+            # Chat Statistics
+            if st.session_state.messages:
+                st.markdown("---")
+                st.subheader("💬 Chat Stats")
+                total_messages = len(st.session_state.messages)
+                user_messages = len([m for m in st.session_state.messages if m['role'] == 'user'])
+                assistant_messages = len([m for m in st.session_state.messages if m['role'] == 'assistant'])
+
+                col_stats1, col_stats2 = st.columns(2)
+                with col_stats1:
+                    st.metric("Total Messages", total_messages)
+                with col_stats2:
+                    st.metric("Q&A Pairs", min(user_messages, assistant_messages))
+
+        # Help section
+        with st.expander("❓ Help & Tips", expanded=False):
+            st.markdown("""
+            ### Getting Started
+            1. **Upload PDF**: Use the file uploader above to select your document
+            2. **Index Document**: Click "🚀 Index & Start" to process the PDF
+            3. **Ask Questions**: Type your questions in the chat input
+
+            ### Tips for Better Results
+            - **Be specific**: "What are the main benefits on page 3?" works better than "Tell me about benefits"
+            - **Use page numbers**: Mention specific pages when you know them
+            - **Ask for summaries**: "Summarize chapter 2" or "Give me an overview"
+            - **Context matters**: Reference previous questions for follow-ups
+
+            ### Performance Tuning
+            - **CPU Threads**: More threads = faster processing, but may slow your system
+            - **Temperature**: Lower = more focused answers, Higher = more creative
+            - **Models**: Different models have different strengths
+
+            ### Troubleshooting
+            - **No response**: Check if Ollama is running and models are downloaded
+            - **Slow performance**: Reduce CPU threads or try a smaller model
+            - **Poor answers**: Try rephrasing your question or adjusting temperature
+            """)
+
+    # Main Chat Area
     st.title("Chat with your PDF")
+    st.markdown("*Ask questions about your uploaded document*")
 
-    for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
+    # Welcome message when no document is loaded
+    if "index" not in st.session_state:
+        st.info("👋 **Welcome to Chat PDF!**")
+        st.markdown("""
+        ### 🚀 Quick Start Guide:
+        1. 📄 **Upload** your PDF document using the sidebar
+        2. 🚀 **Index** the document by clicking "Index & Start"
+        3. 💬 **Chat** with your document using natural language
 
-    if prompt := st.chat_input("Ask something about the PDF..."):
-        if "index" not in st.session_state:
-            st.error("Please upload and index a PDF first!")
-        else:
-            st.session_state.messages.append({"role": "user", "content": prompt})
+        ### 💡 Pro Tips:
+        - Ask specific questions like *"What are the key findings on page 5?"*
+        - Request summaries: *"Summarize the methodology section"*
+        - Get detailed explanations: *"Explain the algorithm in detail"*
+
+        ### 🎯 Best Practices:
+        - **Page-specific queries**: Mention page numbers when possible
+        - **Context-aware**: Reference previous conversations
+        - **Iterative refinement**: Follow up with clarifying questions
+        """)
+
+        # Feature highlights
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.markdown("### 🔍 Smart Search\nAI-powered document search with relevance ranking")
+        with col2:
+            st.markdown("### 📊 Performance Metrics\nReal-time token usage and response time tracking")
+        with col3:
+            st.markdown("### Modern UI\nClean, responsive interface with a professional look")
+
+        return
+
+    # Chat messages
+    chat_container = st.container()
+    with chat_container:
+        for message in st.session_state.messages:
+            with st.chat_message(message["role"]):
+                if message["role"] == "user":
+                    st.markdown(f"**You:** {message['content']}")
+                else:
+                    st.markdown(message["content"])
+
+    # Chat input
+    if prompt := st.chat_input("Ask a question about the PDF...", key="chat_input"):
+        if not prompt.strip():
+            st.warning("Please enter a question.")
+            return
+
+        # Add user message
+        st.session_state.messages.append({"role": "user", "content": prompt})
+
+        with chat_container:
             with st.chat_message("user"):
-                st.markdown(prompt)
+                st.markdown(f"**You:** {prompt}")
 
+        # Generate response
+        with chat_container:
             with st.chat_message("assistant"):
                 response_placeholder = st.empty()
                 full_response = ""
 
-                # better for page specific questions like "what is on page 3".
-                # issues starts from historical data, hence removed
-                # optimize latter
+                # Search and generate
+                with st.spinner("Searching document..."):
+                    results = search_with_rerank(prompt, st.session_state.index, st.session_state.metadata)
 
-                # new_page_match = re.search(r"page\s+(\d+)", prompt.lower())
-                # if new_page_match:
-                #     st.session_state.current_page = int(new_page_match.group(1))
-                # current_page = st.session_state.get("current_page")
-                # results = search_with_rerank(prompt, st.session_state.index, st.session_state.metadata,forced_page=current_page)
-
-                results = search_with_rerank(prompt, st.session_state.index, st.session_state.metadata)
+                if not results:
+                    st.error("No relevant information found in the document.")
+                    return
 
                 start_gen = time.perf_counter()
 
-                stream_response, stats = generate_answer(
-                    prompt, 
-                    results, 
-                    st.session_state.messages, 
-                    st.session_state.user_threads,
-                    st.session_state.temperature,
-                    st.session_state.thinking_model
-                )
+                with st.spinner("Generating response..."):
+                    stream_response, stats = generate_answer(
+                        prompt,
+                        results,
+                        st.session_state.messages,
+                        st.session_state.user_threads,
+                        st.session_state.temperature,
+                        st.session_state.thinking_model
+                    )
 
-                for chunk in stream_response:
-                    full_response += chunk['response']
-                    response_placeholder.markdown(full_response + "▌")
+                    for chunk in stream_response:
+                        full_response += chunk['response']
+                        response_placeholder.markdown(full_response + "▌")
 
                 end_gen = time.perf_counter()
                 gen_time = end_gen - start_gen
 
-                col1, col2, col3 = st.columns(3)
-                col1.metric("Time Taken", f"{gen_time:.2f}s")
-                col2.metric("Tokens Used", f"{stats['compressed_tokens']}")
-                # col3.metric("Tokens Saved", f"{stats['saved_tokens']}", delta_color="normal")
-
+                # Final response
                 response_placeholder.markdown(full_response)
                 logger.info(f"Response generated in {gen_time:.2f}s, tokens: {stats['compressed_tokens']}")
 
-                pages = sorted({res["page"] for res in results})
-                st.caption(f"Sources: Pages {', '.join(map(str, pages))}")
+                # Enhanced metrics display
+                st.markdown("---")
+                col1, col2, col3, col4 = st.columns(4)
 
-            st.session_state.messages.append({"role": "assistant", "content": full_response})
+                with col1:
+                    st.metric("Response Time", f"{gen_time:.2f}s")
+                with col2:
+                    st.metric("Tokens Used", f"{stats['compressed_tokens']:,}")
+                with col3:
+                    if 'saved_tokens' in stats and stats['raw_tokens'] > 0:
+                        savings_pct = (stats['saved_tokens'] / stats['raw_tokens']) * 100
+                        st.metric("Token Savings", f"{savings_pct:.1f}%")
+                    else:
+                        st.metric("Context Quality", "Optimized")
+                with col4:
+                    st.metric("Sources", f"{len(set(res['page'] for res in results))}")
+
+                # Source pages with better formatting
+                pages = sorted(set(res["page"] for res in results))
+                if pages:
+                    st.caption(f"**Source Pages:** {', '.join(map(str, pages))}")
+
+                    # Add relevance scores for top results
+                    with st.expander("🔍 View Relevance Scores", expanded=False):
+                        for i, res in enumerate(results[:3], 1):
+                            st.write(f"**Rank {i}:** Page {res['page']} (Score: {res.get('score', 'N/A'):.4f})")
+
+        # Add assistant response to history
+        st.session_state.messages.append({"role": "assistant", "content": full_response})
+
+        # Auto-scroll to bottom (using empty element as anchor)
+        st.empty()
+
+    # Footer with additional features
+    st.markdown("---")
+    footer_col1, footer_col2, footer_col3 = st.columns([1, 2, 1])
+
+    with footer_col1:
+        if st.session_state.messages:
+            if st.button("Export Chat", help="Download conversation as text file"):
+                chat_text = "# Chat PDF Conversation Export\n\n"
+                for i, msg in enumerate(st.session_state.messages, 1):
+                    role = "User" if msg['role'] == 'user' else "Assistant"
+                    chat_text += f"## Message {i} - {role}\n{msg['content']}\n\n"
+
+                st.download_button(
+                    label="Download",
+                    data=chat_text,
+                    file_name="chat_export.txt",
+                    mime="text/plain"
+                )
+
+    with footer_col2:
+        st.caption("**Tips:** Ask specific questions, mention page numbers, or request summaries for better results.")
+
+    with footer_col3:
+        st.caption(f"**Model:** {st.session_state.get('thinking_model', 'None loaded')}")
 
 if __name__ == '__main__':
     main()
