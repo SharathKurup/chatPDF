@@ -31,7 +31,7 @@ PDF_PATH = os.environ.get("PDF_PATH", "AI Module.pdf")
 CHUNK_SIZE = 250
 OVERLAP_SIZE = 50
 EMBED_MODEL = "nomic-embed-text:latest"
-THINKING_MODEL = "gemma3:1b"
+DEFAULT_THINKING_MODEL = "gemma3:1b"
 HYDE_MODEL = "gemma3:1b"
 BATCH_SIZE = 32
 TOP_K = 3
@@ -46,7 +46,7 @@ MAX_SENTENCES = 8
 MAX_TOKENS = 250
 OVERLAP_TOKENS = 50
 TOKENIZER_CACHE = "tokenizer_cache"
-FAISS_NEAREST_K = 12
+FAISS_SEARCH_K = 12
 
 _ollama_process = None
 
@@ -191,7 +191,7 @@ def generate_embeddings_batch(texts):
     logger.info(f"Completed embedding generation: {len(all_embeddings)} embeddings created")
     return all_embeddings
 
-def generate_answer(query, results, chat_history,threads,temp):
+def generate_answer(query, results, chat_history,threads,temp, thinking_model):
     options = {
         "num_thread": threads,
         "temperature": temp
@@ -263,7 +263,7 @@ Answer:
 """
     # if STREAM:
     return ollama.generate(
-        model=THINKING_MODEL,
+        model=thinking_model,
         prompt=prompt,
         stream=STREAM,
         keep_alive=KEEP_ALIVE,
@@ -299,16 +299,16 @@ def verify_normalized_embedding(embeddings):
     else:
         logger.warning("The embedding is NOT normalized.")
 
-def check_ollama_status():
+def check_ollama_status(thinking_model):
     try:
         response = ollama.list()
         # downloaded_models=[model.get("model") for model in response.get("models",[])]
         downloaded_models = [m.model for m in response.models]
         logger.debug(f"Available Ollama models: {downloaded_models}")
-        is_model_missing = [model for model in [EMBED_MODEL,THINKING_MODEL] if model not in downloaded_models]
+        is_model_missing = [model for model in [EMBED_MODEL,DEFAULT_THINKING_MODEL,thinking_model] if model not in downloaded_models]
 
         if not is_model_missing:
-            logger.info(f"All required models available: {[EMBED_MODEL, THINKING_MODEL]}")
+            logger.info(f"All required models available: {[EMBED_MODEL, DEFAULT_THINKING_MODEL, thinking_model]}")
             return True
         else:
             logger.warning(f"Missing models: {is_model_missing}")
@@ -407,7 +407,7 @@ def search_with_rerank(query, index, text_metadata):
     query_vector = np.array(response["embeddings"][0], dtype=np.float32)
 
     faiss_start = time.perf_counter()
-    distances, indices = index.search(query_vector.reshape(1, -1), k=FAISS_NEAREST_K)
+    distances, indices = index.search(query_vector.reshape(1, -1), k=FAISS_SEARCH_K)
     faiss_end = time.perf_counter()
 
     candidates = [text_metadata[i] for i in indices[0]]
@@ -454,15 +454,16 @@ def compress_context(query, full_text):
 
     return compressed if compressed else full_text[:1000]  # Fallback to snippet
 
-def build_pipeline(pdf_file):
+def build_pipeline(pdf_file,thinking_model):
     logger.info(f"=" * 60)
     logger.info(f"Starting pipeline for PDF: {pdf_file}")
     logger.info(f"=" * 60)
     
-    if not check_ollama_status():
-        logger.error("Please start Ollama or run 'ollama pull <model_name>' for missing models.")
-        st.warning("Please start Ollama or run 'ollama pull <model_name>' for missing models.")
-        sys.exit(1)
+    if not check_ollama_status(thinking_model):
+        error_msg = f"Required models not available. Please run: ollama pull {EMBED_MODEL} && ollama pull {thinking_model}"
+        logger.error(error_msg)
+        st.error(error_msg)
+        st.stop()
 
     logger.info("Step 1: Calculating PDF hash...")
     current_hash = calculate_pdf_hash(pdf_file)
@@ -528,9 +529,18 @@ def get_ollama_models():
         return models_list
     except Exception as exc:
         logger.error(f"Failed to retrieve Ollama models: {exc}")
-        return []
+        return [DEFAULT_THINKING_MODEL]
 
 def main():
+    if "user_threads" not in st.session_state:
+        st.session_state.user_threads = get_safe_threads()
+    if "temperature" not in st.session_state:
+        st.session_state.temperature = 0.1
+    if "thinking_model" not in st.session_state:
+        st.session_state.thinking_model = DEFAULT_THINKING_MODEL
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
+
     with st.sidebar:
         st.title("Document Settings")
         uploaded_file = st.sidebar.file_uploader("Choose a PDF file", type=["pdf"])
@@ -544,7 +554,7 @@ def main():
 
             if st.button("Index & Start"):
                 with st.spinner(text="Analyzing document...", show_time=True):
-                    idx, metadata = build_pipeline(tmp_path)
+                    idx, metadata = build_pipeline(tmp_path,st.session_state.thinking_model)
                     st.session_state.index = idx
                     st.session_state.metadata = metadata
                     st.success(f"Ready to Chat!")
@@ -553,19 +563,28 @@ def main():
                 st.session_state.messages = []
                 st.rerun()
 
-            option = st.selectbox("Choose an option:", get_ollama_models())
-            st.write("You selected:", option)
-            THINKING_MODEL = option
+            available_models = get_ollama_models()
+            st.session_state.thinking_model = st.selectbox(
+                "Choose model:",
+                available_models,
+                index=available_models.index(st.session_state.thinking_model) if st.session_state.thinking_model in available_models else 0
+            )
 
             st.subheader("⚙️ Performance Tuning")
-            user_threads = st.slider("CPU Threads", 1, psutil.cpu_count(), get_safe_threads())
-            use_flash = st.toggle("Flash Attention", value=True)
-            temperature = st.slider("Creativity (Temp)", 0.0, 1.0, 0.1)
+            st.session_state.user_threads = st.slider(
+                "CPU Threads", 
+                1, 
+                psutil.cpu_count(), 
+                st.session_state.user_threads
+            )
+            st.session_state.temperature = st.slider(
+                "Creativity (Temp)", 
+                0.0, 
+                1.0, 
+                st.session_state.temperature
+            )
 
     st.title("Chat with your PDF")
-
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
 
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
@@ -597,8 +616,14 @@ def main():
 
                 start_gen = time.perf_counter()
 
-                stream_response, stats = generate_answer(prompt, results, st.session_state.messages, user_threads,
-                                                         temperature)
+                stream_response, stats = generate_answer(
+                    prompt, 
+                    results, 
+                    st.session_state.messages, 
+                    st.session_state.user_threads,
+                    st.session_state.temperature,
+                    st.session_state.thinking_model
+                )
 
                 for chunk in stream_response:
                     full_response += chunk['response']
@@ -613,6 +638,7 @@ def main():
                 # col3.metric("Tokens Saved", f"{stats['saved_tokens']}", delta_color="normal")
 
                 response_placeholder.markdown(full_response)
+                logger.info(f"Response generated in {gen_time:.2f}s, tokens: {stats['compressed_tokens']}")
 
                 pages = sorted({res["page"] for res in results})
                 st.caption(f"Sources: Pages {', '.join(map(str, pages))}")
@@ -620,6 +646,5 @@ def main():
             st.session_state.messages.append({"role": "assistant", "content": full_response})
 
 if __name__ == '__main__':
-    logger.info('Welcome to Chat with PDF.')
     main()
 
