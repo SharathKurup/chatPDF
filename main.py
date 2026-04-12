@@ -1,5 +1,4 @@
 import os
-import sys
 import numpy as np
 import ollama
 import pdfplumber
@@ -103,10 +102,10 @@ def readpdf(pdf_file):
                 all_texts.append((i + 1, text))
     except FileNotFoundError:
         logger.error(f"PDF not found: {pdf_file}")
-        sys.exit(1)
+        raise
     except Exception as exc:
         logger.error(f"Failed to read PDF: {exc}")
-        sys.exit(1)
+        raise
 
     return all_texts
 
@@ -316,11 +315,11 @@ def check_ollama_status(thinking_model):
         response = ollama.list()
         downloaded_models = [m.model for m in response.models]
         logger.debug(f"Available Ollama models: {downloaded_models}")
-        is_model_missing = [model for model in [EMBED_MODEL, DEFAULT_THINKING_MODEL, thinking_model] if
-                            model not in downloaded_models]
+        required_models = list(dict.fromkeys([EMBED_MODEL, HYDE_MODEL, DEFAULT_THINKING_MODEL, thinking_model]))
+        is_model_missing = [model for model in required_models if model not in downloaded_models]
 
         if not is_model_missing:
-            logger.info(f"All required models available: {[EMBED_MODEL, DEFAULT_THINKING_MODEL, thinking_model]}")
+            logger.info(f"All required models available: {required_models}")
             return True
         else:
             logger.warning(f"Missing models: {is_model_missing}")
@@ -504,11 +503,15 @@ def build_pipeline(pdf_file, thinking_model, progress_callback=None, override_db
     st.info("New PDF detected. Processing...")
 
     report(4, "Step 4/7: Reading PDF...")
-    texts = readpdf(pdf_file)
+    try:
+        texts = readpdf(pdf_file)
+    except Exception as exc:
+        st.error(f"Failed to read PDF: {exc}")
+        st.stop()
     if not texts:
         logger.error("No text found in PDF.")
-        st.warning("No text found in PDF.")
-        sys.exit(1)
+        st.error("No text found in PDF. The file may be scanned or image-only.")
+        st.stop()
 
     report(5, "Step 5/7: Creating chunks...")
     metadata = []
@@ -517,8 +520,8 @@ def build_pipeline(pdf_file, thinking_model, progress_callback=None, override_db
 
     if not metadata:
         logger.error("No content chunks were created from the PDF.")
-        st.warning("No content chunks were created from the PDF.")
-        sys.exit(1)
+        st.error("No content chunks were created from the PDF.")
+        st.stop()
 
     report(6, "Step 6/7: Generating embeddings...")
     text_data = [item["text"] for item in metadata]
@@ -673,6 +676,13 @@ def main():
                         st.session_state.metadata = metadata
                         progress_bar.empty()
                         status_text.empty()
+
+                        # Clean up temp file — no longer needed after indexing
+                        try:
+                            os.remove(tmp_path)
+                            logger.info(f"Removed temp file: {tmp_path}")
+                        except Exception as e:
+                            logger.warning(f"Could not remove temp file {tmp_path}: {e}")
 
                     st.success("✅ Ready to Chat!")
 

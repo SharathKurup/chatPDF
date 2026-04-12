@@ -151,9 +151,6 @@ You can customize the behavior by modifying these parameters in `main.py`:
 
 ### Core Parameters
 ```python
-# Legacy parameters (not used in current token-based chunking)
-CHUNK_SIZE = 250           # Not used - kept for compatibility
-OVERLAP_SIZE = 50          # Not used - kept for compatibility
 
 # Active parameters
 EMBED_MODEL = "nomic-embed-text:latest"  # Embedding model for semantic search
