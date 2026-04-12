@@ -286,3 +286,5 @@ Feel free to fork this project, make improvements, and submit pull requests.
 
 For issues or questions, please check the troubleshooting section or create an issue in the repository.
 
+## Sample UI
+<img width="1273" height="676" alt="image" src="https://github.com/user-attachments/assets/61f811f1-2ac9-4555-98d5-0edd13b363f1" />
