@@ -27,9 +27,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
-PDF_PATH = os.environ.get("PDF_PATH", "AI Module.pdf")
-CHUNK_SIZE = 250
-OVERLAP_SIZE = 50
 EMBED_MODEL = "nomic-embed-text:latest"
 DEFAULT_THINKING_MODEL = "gemma3:1b"
 HYDE_MODEL = "gemma3:1b"
@@ -38,7 +35,6 @@ TOP_K = 3
 STREAM = True
 KEEP_ALIVE = '1h'
 DB_FOLDER = "db"
-OVERRIDE_DB = False
 RERANK_MODEL = "ms-marco-MiniLM-L-12-v2"  # https://huggingface.co/prithivida/flashrank/tree/main
 CACHE_DIR = "./model_cache"
 TEMP_PATH = "./temp"
@@ -116,8 +112,6 @@ def readpdf(pdf_file):
 
 
 def get_safe_threads():
-    # Returns logical cores. For a 16-core CPU, this returns 16.
-    # We subtract 1 or 2 to keep the OS and Streamlit responsive.
     cores = psutil.cpu_count(logical=True)
     return max(1, cores - 2)
 
@@ -131,7 +125,7 @@ st.set_page_config(
 if not is_ollama_running():
     with st.spinner("Initializing Ollama..."):
         if not start_ollama_server():
-            st.error("Failed to start Ollama.");
+            st.error("Failed to start Ollama.")
             st.stop()
         atexit.register(cleanup_ollama)
 tokenizer = tiktoken.get_encoding("cl100k_base")
@@ -148,6 +142,19 @@ def generate_advanced_chunks(page_content, page_num):
         chunk["full_context"] = page_content
 
     return search_chunks
+
+
+def _get_overlap(current_chunk):
+    """Returns sentences from the end of current_chunk up to OVERLAP_TOKENS."""
+    overlap = []
+    overlap_tokens = 0
+    for sentence in reversed(current_chunk):
+        sentence_tokens = get_token_length(sentence)
+        if overlap_tokens + sentence_tokens > OVERLAP_TOKENS:
+            break
+        overlap.insert(0, sentence)
+        overlap_tokens += sentence_tokens
+    return overlap, overlap_tokens
 
 
 def generate_chunks_recursive_tokens(text, page_num):
@@ -169,16 +176,16 @@ def generate_chunks_recursive_tokens(text, page_num):
                 if current_tokens + sentence_token > MAX_TOKENS:
                     chunk_text = " ".join(current_chunk)
                     chunks.append({"text": chunk_text, "page": page_num})
-                    current_chunk = current_chunk[-2:] if len(current_chunk) > 2 else []
-                    current_tokens = sum(get_token_length(cur_chunk) for cur_chunk in current_chunk)
+                    # Change 6: token-aware overlap for sentence-level path
+                    current_chunk, current_tokens = _get_overlap(current_chunk)
                 current_chunk.append(sentence)
                 current_tokens += sentence_token
         else:
             if current_tokens + paragraph_tokens > MAX_TOKENS:
                 chunk_text = "\n\n".join(current_chunk)
                 chunks.append({"text": chunk_text, "page": page_num})
-                current_chunk = []
-                current_tokens = 0
+                # Change 7: token-aware overlap for paragraph-level path
+                current_chunk, current_tokens = _get_overlap(current_chunk)
             current_chunk.append(paragraph)
             current_tokens += paragraph_tokens
 
@@ -227,8 +234,6 @@ def generate_answer(query, results, chat_history, threads, temp, thinking_model,
 
     context_parts = []
     for page, full_context in unique_pages.items():
-        # If user asked for a specific page, send the WHOLE page content
-        # Otherwise, use the keyword compression for general questions
         if page_match:
             compressed_text = full_context
         else:
@@ -291,26 +296,15 @@ Answer:
 def generate_hypothetical_answer(query):
     """HyDE: Generates a brief fake answer to improve vector search."""
     prompt = f"Write a 2-sentence technical summary answering: {query}"
-    # Use a fast call to Ollama (non-streaming for speed)
     response = ollama.generate(model=HYDE_MODEL, prompt=prompt, stream=False)
     return response['response']
 
 
 def verify_normalized_embedding(embeddings):
-    """
-        How to Check if the Output is Normalized
-        In the context of embeddings, "normalization" almost always refers to Vector Normalization (L2),
-        which ensures the embedding has a magnitude (length) of exactly 1.
-        You can check this mathematically using Python.
-        If the sum of the squares of all numbers in the embedding vector equals approximately 1.0, it is normalized.
-    """
     embeddings_array = np.array(embeddings)
     norms = np.linalg.norm(embeddings_array, axis=1)
-
     all_normalized = np.all(np.isclose(norms, 1.0))
-
     logger.debug(f"Vector Magnitude: {norms}")
-
     if all_normalized:
         logger.info("The embedding is L2 normalized.")
     else:
@@ -320,7 +314,6 @@ def verify_normalized_embedding(embeddings):
 def check_ollama_status(thinking_model):
     try:
         response = ollama.list()
-        # downloaded_models=[model.get("model") for model in response.get("models",[])]
         downloaded_models = [m.model for m in response.models]
         logger.debug(f"Available Ollama models: {downloaded_models}")
         is_model_missing = [model for model in [EMBED_MODEL, DEFAULT_THINKING_MODEL, thinking_model] if
@@ -390,7 +383,6 @@ def search_with_rerank(query, index, text_metadata):
     if target_page:
         start_time = time.perf_counter()
 
-        # Strict filtering (no semantic noise)
         candidates = [
             item for item in text_metadata
             if item["page"] == target_page
@@ -400,7 +392,6 @@ def search_with_rerank(query, index, text_metadata):
             logger.warning(f"No candidates found for page {target_page}")
             return [], page_match
 
-        # Prepare reranker input
         rerank_items = [
             {
                 "id": i,
@@ -464,7 +455,6 @@ def search_with_rerank(query, index, text_metadata):
 
 
 def compress_context(query, full_text):
-    # Split into sentences
     sentences = re.split(r'(?<=[.!?]) +', full_text)
     query_words = set(query.lower().split())
 
@@ -477,7 +467,7 @@ def compress_context(query, full_text):
     top_sentences = sorted(top_sentences, key=lambda x: x[1])
     compressed = " ".join([s for _, _, s in top_sentences])
 
-    return compressed if compressed else full_text[:1000]  # Fallback to snippet
+    return compressed if compressed else full_text[:1000]
 
 
 def build_pipeline(pdf_file, thinking_model, progress_callback=None, override_db=False):
@@ -486,9 +476,9 @@ def build_pipeline(pdf_file, thinking_model, progress_callback=None, override_db
         if progress_callback:
             progress_callback(step, label)
 
-    logger.info(f"=" * 60)
+    logger.info("=" * 60)
     logger.info(f"Starting pipeline for PDF: {pdf_file}")
-    logger.info(f"=" * 60)
+    logger.info("=" * 60)
 
     report(1, "Step 1/7: Checking models...")
     if not check_ollama_status(thinking_model):
@@ -547,14 +537,15 @@ def build_pipeline(pdf_file, thinking_model, progress_callback=None, override_db
 
     save_vector_db(index, metadata, current_hash)
 
-    logger.info(f"=" * 60)
-    logger.info(f"Pipeline completed successfully!")
+    logger.info("=" * 60)
+    logger.info("Pipeline completed successfully!")
     logger.info(f"Total chunks: {len(metadata)}, Total vectors: {index.ntotal}")
-    logger.info(f"=" * 60)
+    logger.info("=" * 60)
 
     return index, metadata
 
 
+@st.cache_data(ttl=60)
 def get_ollama_models():
     try:
         response = ollama.list()
@@ -569,39 +560,39 @@ def get_ollama_models():
 
 
 def main():
-    # Custom CSS for better styling
     st.markdown("""
     <style>
     .stApp {
-        background: linear-gradient(135deg, #1e3c72 0%, #2a5298 100%);
-        color: white;
+        background: #0e1117;
+        color: #e8eaf0;
     }
     .main .block-container {
-        background: rgba(30, 30, 30, 0.95);
-        color: white;
+        background: #1a1d27;
+        color: #e8eaf0;
         border-radius: 10px;
         padding: 2rem;
         margin: 1rem auto;
-        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.3);
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
     }
     .stSidebar {
-        background: rgba(30, 30, 30, 0.95);
-        color: white;
-        border-radius: 10px;
-        margin: 1rem;
-        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.3);
+        background: #13161f;
+        color: #e8eaf0;
+        border-right: 1px solid rgba(255, 255, 255, 0.06);
     }
     .stChatMessage {
         border-radius: 10px;
         margin: 0.5rem 0;
         padding: 1rem;
-        background: rgba(45, 45, 45, 0.8) !important;
+        background: #1e2130 !important;
+        border: 1px solid rgba(255, 255, 255, 0.06);
     }
     .stMetric {
-        background: rgba(45, 45, 45, 0.8);
+        background: #1e2130;
         border-radius: 8px;
         padding: 0.5rem;
-        box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
+        border: 1px solid rgba(255, 255, 255, 0.06);
+        box-shadow: 0 2px 4px rgba(0, 0, 0, 0.3);
     }
     .stButton>button {
         border-radius: 10px;
@@ -640,15 +631,13 @@ def main():
             )
 
             if uploaded_file:
-                # Reset chat when a new file is selected
                 if st.session_state.uploaded_file_name != uploaded_file.name:
                     st.session_state.messages = []
                     st.session_state.index = None
                     st.session_state.metadata = None
                     st.session_state.uploaded_file_name = uploaded_file.name
 
-                # File info display
-                file_size = len(uploaded_file.getbuffer()) / 1024 / 1024  # MB
+                file_size = len(uploaded_file.getbuffer()) / 1024 / 1024
                 st.success(f"📎 **{uploaded_file.name}** ({file_size:.1f} MB)")
 
                 tmp_path = os.path.join(TEMP_PATH, uploaded_file.name)
@@ -657,7 +646,6 @@ def main():
                 with open(tmp_path, "wb") as f:
                     f.write(uploaded_file.getbuffer())
 
-                # Action buttons in columns
                 index_requested = False
                 col1, col2 = st.columns(2)
                 with col1:
@@ -678,7 +666,6 @@ def main():
                             progress_bar.progress(int((step / 7) * 100))
                             status_text.text(label)
 
-                        # Reset conversation when indexing a document
                         st.session_state.messages = []
                         idx, metadata = build_pipeline(tmp_path, st.session_state.thinking_model, progress_callback,
                                                        st.session_state.override_db)
@@ -698,7 +685,6 @@ def main():
         # Settings Expander
         with st.expander("⚙️ Settings", expanded=False):
 
-            # AI Model
             st.subheader("AI Model")
             available_models = get_ollama_models()
             current_model = st.session_state.get('thinking_model', DEFAULT_THINKING_MODEL)
@@ -718,7 +704,6 @@ def main():
             )
             st.session_state.thinking_model = selected_model
 
-            # Performance Tuning
             st.markdown("---")
             st.subheader("Performance Tuning")
 
@@ -739,7 +724,6 @@ def main():
                 help="Lower = more focused, Higher = more creative"
             )
 
-            # Override DB
             st.markdown("---")
             st.subheader("Database")
             st.session_state.override_db = st.checkbox(
@@ -759,21 +743,6 @@ def main():
             st.metric("Safe Threads", f"{safe_threads}")
 
         st.markdown("---")
-
-        # Chat Statistics
-        if st.session_state.messages:
-            st.subheader("💬 Chat Stats")
-            total_messages = len(st.session_state.messages)
-            user_messages = len([m for m in st.session_state.messages if m['role'] == 'user'])
-            assistant_messages = len([m for m in st.session_state.messages if m['role'] == 'assistant'])
-
-            col_stats1, col_stats2 = st.columns(2)
-            with col_stats1:
-                st.metric("Total Messages", total_messages)
-            with col_stats2:
-                st.metric("Q&A Pairs", min(user_messages, assistant_messages))
-
-            st.markdown("---")
 
         # Help section
         with st.expander("❓ Help & Tips", expanded=False):
@@ -804,8 +773,8 @@ def main():
     st.title("Chat with your PDF")
     st.markdown("*Ask questions about your uploaded document*")
 
-    # Welcome message when no document is loaded
-    if "index" not in st.session_state:
+    # Change 3: fixed welcome screen condition
+    if st.session_state.index is None:
         st.info("👋 **Welcome to Chat PDF!**")
         st.markdown("""
         ### 🚀 Quick Start Guide:
@@ -824,7 +793,6 @@ def main():
         - **Iterative refinement**: Follow up with clarifying questions
         """)
 
-        # Feature highlights
         col1, col2, col3 = st.columns(3)
         with col1:
             st.markdown("### 🔍 Smart Search\nAI-powered document search with relevance ranking")
@@ -844,6 +812,31 @@ def main():
                     st.markdown(f"**You:** {message['content']}")
                 else:
                     st.markdown(message["content"])
+                    # Render per-message metrics if stored
+                    if "response_stats" in message:
+                        ms = message["response_stats"]
+                        st.markdown("---")
+                        col1, col2, col3, col4 = st.columns(4)
+                        with col1:
+                            st.metric("Response Time", f"{ms['gen_time']:.2f}s")
+                        with col2:
+                            st.metric("Tokens Used", f"{ms['stats']['compressed_tokens']:,}")
+                        with col3:
+                            if ms['stats']['raw_tokens'] > 0:
+                                savings_pct = (ms['stats']['saved_tokens'] / ms['stats']['raw_tokens']) * 100
+                                st.metric("Token Savings", f"{savings_pct:.1f}%")
+                            else:
+                                st.metric("Context Quality", "Optimized")
+                        with col4:
+                            st.metric("Sources", f"{len(set(r['page'] for r in ms['results']))}")
+
+                        if ms['pages']:
+                            st.caption(f"**Source Pages:** {', '.join(map(str, ms['pages']))}")
+                            with st.expander("🔍 View Relevance Scores", expanded=False):
+                                for i, res in enumerate(ms['results'], 1):
+                                    score = res['score']
+                                    score_str = f"{score:.4f}" if score is not None else "N/A"
+                                    st.write(f"**Rank {i}:** Page {res['page']} (Score: {score_str})")
 
     # Chat input
     if prompt := st.chat_input("Ask a question about the PDF...", key="chat_input"):
@@ -851,20 +844,17 @@ def main():
             st.warning("Please enter a question.")
             return
 
-        # Add user message
         st.session_state.messages.append({"role": "user", "content": prompt})
 
         with chat_container:
             with st.chat_message("user"):
                 st.markdown(f"**You:** {prompt}")
 
-        # Generate response
         with chat_container:
             with st.chat_message("assistant"):
                 response_placeholder = st.empty()
                 full_response = ""
 
-                # Search and generate
                 with st.spinner("Searching document..."):
                     results, page_match = search_with_rerank(prompt, st.session_state.index, st.session_state.metadata)
 
@@ -885,51 +875,31 @@ def main():
                         page_match
                     )
 
-                    for chunk in stream_response:
-                        full_response += chunk['response']
-                        response_placeholder.markdown(full_response + "▌")
+                    # Change 4: try/finally ensures cursor never freezes in history
+                    try:
+                        for chunk in stream_response:
+                            full_response += chunk['response']
+                            response_placeholder.markdown(full_response + "▌")
+                    finally:
+                        response_placeholder.markdown(full_response)
 
                 end_gen = time.perf_counter()
                 gen_time = end_gen - start_gen
 
-                # Final response
-                response_placeholder.markdown(full_response)
                 logger.info(f"Response generated in {gen_time:.2f}s, tokens: {stats['compressed_tokens']}")
 
-                # Enhanced metrics display
-                st.markdown("---")
-                col1, col2, col3, col4 = st.columns(4)
-
-                with col1:
-                    st.metric("Response Time", f"{gen_time:.2f}s")
-                with col2:
-                    st.metric("Tokens Used", f"{stats['compressed_tokens']:,}")
-                with col3:
-                    if 'saved_tokens' in stats and stats['raw_tokens'] > 0:
-                        savings_pct = (stats['saved_tokens'] / stats['raw_tokens']) * 100
-                        st.metric("Token Savings", f"{savings_pct:.1f}%")
-                    else:
-                        st.metric("Context Quality", "Optimized")
-                with col4:
-                    st.metric("Sources", f"{len(set(res['page'] for res in results))}")
-
-                # Source pages with better formatting
-                pages = sorted(set(res["page"] for res in results))
-                if pages:
-                    st.caption(f"**Source Pages:** {', '.join(map(str, pages))}")
-
-                    # Add relevance scores for top results
-                    with st.expander("🔍 View Relevance Scores", expanded=False):
-                        for i, res in enumerate(results[:3], 1):
-                            st.write(f"**Rank {i}:** Page {res['page']} (Score: {res.get('score', 'N/A'):.4f})")
-
-        # Add assistant response to history
-        st.session_state.messages.append({"role": "assistant", "content": full_response})
-
-        # Auto-scroll to bottom (using empty element as anchor)
+        st.session_state.messages.append({
+            "role": "assistant",
+            "content": full_response,
+            "response_stats": {
+                "gen_time": gen_time,
+                "stats": stats,
+                "pages": sorted(set(res["page"] for res in results)),
+                "results": [{"page": res["page"], "score": res.get("score")} for res in results[:3]]
+            }
+        })
         st.rerun()
 
-    # Footer with additional features
     st.markdown("---")
     footer_col1, footer_col2, footer_col3 = st.columns([1, 2, 1])
 
