@@ -127,7 +127,7 @@ This will launch the app in your default web browser at `http://localhost:8501`.
 
 ### Using the Web Interface
 
-1. **Upload a PDF**: Use the file uploader in the sidebar to select and upload your PDF document (or the app will use the default "AI Module.pdf" if available).
+1. **Upload a PDF**: Use the file uploader in the sidebar to select and upload your PDF document
 2. **Index the Document**: Click the "🚀 Index & Start" button to process and index the PDF. This may take a few moments for large documents.
 3. **Start Chatting**: Once indexed, you can ask questions about the PDF content in the chat input box.
 4. **View Responses**: The AI will provide answers based on the document, with sources cited by page numbers and real-time metrics displayed.
@@ -167,7 +167,6 @@ TOP_K = 3                                 # Number of top re-ranked chunks to us
 ```python
 DB_FOLDER = "db"            # Folder to store vector database and metadata
 OVERRIDE_DB = False         # Set to True to force regeneration of the vector database
-PDF_PATH = os.environ.get("PDF_PATH", "AI Module.pdf")  # Default PDF path
 ```
 
 ### Streaming & Connection Parameters
@@ -245,7 +244,6 @@ chatPDF/
 ├── requirements.txt     # Python dependencies
 ├── README.md            # This file
 ├── .gitignore           # Git ignore file for excluding temporary files
-├── AI Module.pdf        # Default sample PDF document
 ├── db/                  # Vector database storage (auto-created)
 │   ├── index.faiss      # FAISS vector index
 │   └── metadata.pkl     # Chunk metadata and PDF hash
@@ -288,5 +286,3 @@ Feel free to fork this project, make improvements, and submit pull requests.
 
 For issues or questions, please check the troubleshooting section or create an issue in the repository.
 
-## Sample UI
-<img width="1271" height="659" alt="image" src="https://github.com/user-attachments/assets/d940b8df-4e8c-4103-bfa0-4f71886c598c" />
