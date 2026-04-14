@@ -6,3 +6,4 @@ flashrank
 streamlit
 psutil
 tiktoken
+matplotlib

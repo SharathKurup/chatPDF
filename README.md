@@ -19,6 +19,8 @@ A conversational AI web application built with Streamlit that allows you to chat
 - ⚙️ **Performance Tuning**: Adjustable CPU threads, temperature, and other parameters
 - 📤 **Chat Export**: Download conversation history as text files
 - 🖥️ **System Information**: Displays CPU cores and recommended thread settings
+- 🧪 **RAG Debug Panel**: Optional debug interface showing FAISS scores, rerank scores, and query analysis
+- 🚀 **2026 Optimizations**: Environment variables for enhanced Ollama performance (FLASH_ATTENTION, KV_CACHE_TYPE)
 
 ## How It Works
 
@@ -55,6 +57,7 @@ The application automatically caches the vector database and embedding vectors:
   - **flashrank**: For intelligent result re-ranking
   - **psutil**: For system information and thread management
   - **tiktoken**: For token counting and chunking
+  - **matplotlib**: For debug panel visualizations
   - **hashlib**: For PDF hashing (built-in)
   - **pickle**: For metadata serialization (built-in)
   - **logging**: For logging (built-in)
@@ -82,6 +85,7 @@ The following packages will be installed:
 - **flashrank**: For intelligent re-ranking of search results using MS-MARCO-MiniLM model
 - **psutil**: For retrieving system information like CPU cores
 - **tiktoken**: For accurate token counting in text processing
+- **matplotlib**: For generating debug panel charts and visualizations
 
 > **Note**: If you have a compatible GPU, use `faiss-gpu` instead of `faiss-cpu` for faster performance
 
@@ -95,7 +99,7 @@ Once Ollama is installed, pull the required models:
 
 ```bash
 # Pull the embedding model (required for semantic search)
-ollama pull nomic-embed-text
+ollama pull nomic-embed-text:latest
 
 # Pull the reasoning/generation model (required for answer generation and HyDE)
 ollama pull gemma3:1b
@@ -112,6 +116,74 @@ ollama serve
 Or if Ollama is installed as a service, it will start automatically on system startup.
 
 > **Note**: The application will automatically attempt to start Ollama if it's not running when you launch the app.
+
+### 5. Model Management
+
+The application uses several models that are cached locally for performance:
+
+#### Ollama Models
+- **nomic-embed-text:latest**: Used for generating text embeddings (semantic search)
+- **gemma3:1b**: Used for answer generation and HYDE (Hypothetical Document Embeddings)
+
+**To update models:**
+```bash
+# Update embedding model
+ollama pull nomic-embed-text:latest
+
+# Update reasoning model
+ollama pull gemma3:1b
+
+# List all installed models
+ollama list
+
+# Remove unused models
+ollama rm <model_name>
+```
+
+#### FlashRank Model
+- **ms-marco-MiniLM-L-12-v2**: Used for re-ranking search results
+- **Location**: Automatically downloaded to `model_cache/` on first use
+- **Update**: Delete the `model_cache/` folder to force re-download on next run
+
+#### TikToken Tokenizer
+- **cl100k_base**: Used for token counting and chunking
+- **Cache Location**: `tokenizer_cache/`
+- **Update**: The tokenizer is downloaded automatically; clear `tokenizer_cache/` if issues occur
+
+## Modelfile for Custom RAG Model
+
+### Why the Modelfile was created
+
+The included `Modelfile` creates an optimized version of `qwen2.5:7b` specifically for RAG workflows. It enforces deterministic responses, prevents hallucination, and extends the context window to handle larger document chunks efficiently.
+
+### How it works
+
+The Modelfile overrides the base model's default parameters and system prompt. Low temperature ensures factual precision, increased context window allows processing of longer retrieved passages, and the system prompt adds lightweight guardrails against incorrect information.
+
+### Contents explanation
+
+- `FROM qwen2.5:7b` – Base model.
+- `PARAMETER temperature 0.1` – Low randomness for consistent answers.
+- `PARAMETER top_p 0.7` – Nucleus sampling threshold for token selection.
+- `PARAMETER repeat_penalty 1.1` – Discourages repetitive output.
+- `PARAMETER num_ctx 16384` – 16K token context window for RAG chunks.
+- `PARAMETER num_batch 512` – Batch size for prompt processing.
+- `SYSTEM` prompt – Instructs model to prioritize accuracy and avoid hallucination.
+
+### How to update, save, create, and use the model
+
+1. **Update** – Edit the `Modelfile` to change parameters or the system prompt.
+2. **Save** – Keep the file named `Modelfile` in your project directory.
+3. **Create** – Run the following command:
+   ```bash
+   ollama create qwen2.5-16k -f Modelfile
+   ```
+4. **Use** – In the Streamlit sidebar, select `qwen2.5-16k` from the model dropdown.
+
+You can also run the model directly in terminal:
+```bash
+ollama run qwen2.5-16k
+```
 
 ## Usage
 
@@ -132,7 +204,7 @@ This will launch the app in your default web browser at `http://localhost:8501`.
 3. **Start Chatting**: Once indexed, you can ask questions about the PDF content in the chat input box.
 4. **View Responses**: The AI will provide answers based on the document, with sources cited by page numbers and real-time metrics displayed.
 5. **Clear Chat History**: Use the "🗑️ Clear Chat History" button in the sidebar to reset the conversation.
-6. **Model Selection**: Choose different AI models from the dropdown in the sidebar for varied responses.
+6. **Model Selection**: Choose different AI models from the dropdown in the sidebar for varied responses. Use `qwen2.5-16k` for optimized RAG performance.
 7. **Performance Tuning**: Adjust CPU threads and temperature settings for optimal performance.
 8. **Export Chat**: Download the conversation history as a text file using the footer button.
 
@@ -151,7 +223,6 @@ You can customize the behavior by modifying these parameters in `main.py`:
 
 ### Core Parameters
 ```python
-
 # Active parameters
 EMBED_MODEL = "nomic-embed-text:latest"  # Embedding model for semantic search
 DEFAULT_THINKING_MODEL = "gemma3:1b"      # Default LLM model for generating answers
@@ -189,6 +260,17 @@ FAISS_SEARCH_K = 12         # Number of candidates to retrieve before re-ranking
 - **Change FAISS_SEARCH_K** to retrieve more candidates for potentially better re-ranking (higher = better quality, slower)
 - **Adjust temperature** in the UI for more creative (higher) or focused (lower) responses
 - **Increase CPU threads** for faster processing if you have available cores (monitor system responsiveness)
+
+## Environment Variables
+
+The application sets the following environment variables for Ollama optimization:
+
+```python
+OLLAMA_FLASH_ATTENTION = "1"  # Enables Flash Attention for faster inference
+OLLAMA_KV_CACHE_TYPE = "q8_0"  # Uses Q8_0 quantization for KV cache (2026 optimization)
+```
+
+These are automatically configured when starting Ollama through the application.
 
 ## Troubleshooting
 
@@ -239,8 +321,8 @@ FAISS_SEARCH_K = 12         # Number of candidates to retrieve before re-ranking
 chatPDF/
 ├── main.py              # Main application script with Streamlit interface
 ├── requirements.txt     # Python dependencies
+├── Modelfile            # Custom model configuration for qwen2.5-16k
 ├── README.md            # This file
-├── .gitignore           # Git ignore file for excluding temporary files
 ├── db/                  # Vector database storage (auto-created)
 │   ├── index.faiss      # FAISS vector index
 │   └── metadata.pkl     # Chunk metadata and PDF hash
@@ -267,6 +349,8 @@ This project is open source and available for personal and educational use.
 - ✅ **Context Compression**: Implemented keyword-based context compression to reduce token usage
 - ✅ **Dynamic Model Selection**: Added support for choosing from available Ollama models
 - ✅ **File Upload Support**: Implemented PDF upload through Streamlit interface
+- ✅ **RAG Debug Panel**: Added debug interface for development and analysis
+- ✅ **2026 Optimizations**: Environment variables for enhanced performance
 - 🔄 **Semantic Chunking**: Consider implementing semantic chunking for even better context preservation
 - 📚 **Multiple PDF Support**: Support for multiple PDF files simultaneously
 - 📤 **Enhanced Export**: Export chat history in various formats (JSON, Markdown)
@@ -284,4 +368,4 @@ Feel free to fork this project, make improvements, and submit pull requests.
 For issues or questions, please check the troubleshooting section or create an issue in the repository.
 
 ## Sample UI
-<img width="1273" height="676" alt="image" src="https://github.com/user-attachments/assets/61f811f1-2ac9-4555-98d5-0edd13b363f1" />
+<img width="1266" height="654" alt="image" src="https://github.com/user-attachments/assets/9cd12e6c-4bcd-48e1-aa1d-9c631baa9276" />

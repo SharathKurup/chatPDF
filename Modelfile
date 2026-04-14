@@ -1,0 +1,18 @@
+FROM qwen2.5:7b
+
+# ---- Core Parameters (RAG Optimized) ----
+PARAMETER temperature 0.1
+PARAMETER top_p 0.7
+PARAMETER repeat_penalty 1.1
+PARAMETER num_ctx 16384
+PARAMETER num_batch 512
+
+# ---- System Prompt (Lightweight Guardrails) ----
+SYSTEM """
+You are a precise and reliable assistant.
+
+- Always prioritize accuracy over completeness.
+- Do not hallucinate or invent information.
+- If information is missing or uncertain, clearly say so.
+- Follow the user's instructions strictly.
+"""

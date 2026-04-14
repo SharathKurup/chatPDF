@@ -139,7 +139,6 @@ def generate_advanced_chunks(page_content, page_num):
     for chunk in search_chunks:
         chunk["text"] = f"[Page {page_num}] {chunk['text']}"
         chunk["full_context"] = page_content
-
     return search_chunks
 
 
@@ -175,7 +174,6 @@ def generate_chunks_recursive_tokens(text, page_num):
                 if current_tokens + sentence_token > MAX_TOKENS:
                     chunk_text = " ".join(current_chunk)
                     chunks.append({"text": chunk_text, "page": page_num})
-                    # Change 6: token-aware overlap for sentence-level path
                     current_chunk, current_tokens = _get_overlap(current_chunk)
                 current_chunk.append(sentence)
                 current_tokens += sentence_token
@@ -183,7 +181,6 @@ def generate_chunks_recursive_tokens(text, page_num):
             if current_tokens + paragraph_tokens > MAX_TOKENS:
                 chunk_text = "\n\n".join(current_chunk)
                 chunks.append({"text": chunk_text, "page": page_num})
-                # Change 7: token-aware overlap for paragraph-level path
                 current_chunk, current_tokens = _get_overlap(current_chunk)
             current_chunk.append(paragraph)
             current_tokens += paragraph_tokens
@@ -218,7 +215,7 @@ def generate_embeddings_batch(texts):
 def generate_answer(query, results, chat_history, threads, temp, thinking_model, page_match):
     options = {
         "num_thread": threads,
-        "temperature": temp
+        "temperature": temp,
     }
 
     unique_pages = {}
@@ -255,22 +252,38 @@ def generate_answer(query, results, chat_history, threads, temp, thinking_model,
     history_text = "\n".join([f"{history['role']}: {history['content']}" for history in chat_history[-5:]])
 
     prompt = f"""
-You are a professional research assistant. 
-Review the ENTIRE context provided below and provide a comprehensive, 
-detailed response covering all sections mentioned.
+You are a professional research assistant.
 
-STRICT RULE: Your answer MUST be based ONLY on the provided Context. 
-Do NOT use outside knowledge. 
-If the information is not in the Context, say "I don't know based on this page."
+Carefully analyze the provided context and answer the question using ONLY the information present in the context.
 
-Instructions:
-1. Every time you state a fact from the context, cite the page number immediately after the sentence in brackets, like this: [Page X].
-2. If the answer isn't in the context, clearly state that you don't know.
-3. Keep your response structured and easy to read.
+STRICT RULES:
+- Do NOT use any external knowledge.
+- Do NOT guess or infer beyond the given context.
+- If the answer is not present, respond with:
+  "I don't know based on the provided context."
 
-IMPORTANT:
-If the question asks about a specific page, ONLY use content from that page, previous page and next page.
-Ignore all other pages.
+CITATION RULES:
+- Every factual statement MUST include a citation in the format [Page X].
+- Do NOT combine multiple pages in a single citation.
+- If multiple facts come from different pages, cite each separately.
+
+PAGE-SPECIFIC RULE:
+- If the question refers to a specific page:
+  - Use ONLY that page, the previous page, and the next page.
+  - Ignore all other pages completely.
+
+ANSWER GUIDELINES:
+- Provide a clear, structured response.
+- Start with a direct answer.
+- Then include supporting details.
+- If only partial information is available:
+  - Answer what is known
+  - Clearly state what is missing
+
+STYLE:
+- Be concise but complete.
+- Avoid repetition.
+- Do not include irrelevant details.
 
 Context:
 {context_text}
@@ -292,9 +305,11 @@ Answer:
     ), stats
 
 
-def generate_hypothetical_answer(query):
+def generate_hypothetical_answer(query,chat_history):
     """HyDE: Generates a brief fake answer to improve vector search."""
-    prompt = f"Write a 2-sentence technical summary answering: {query}"
+    history_text = "\n".join([f"{history['role']}: {history['content']}" for history in chat_history[-2:]])
+    prompt = (f"Write a 2-sentence technical summary answering: {query} "
+              f"Conversation History:) {history_text}")
     response = ollama.generate(model=HYDE_MODEL, prompt=prompt, stream=False)
     return response['response']
 
@@ -369,18 +384,29 @@ def get_ranker():
     return Ranker(model_name=RERANK_MODEL, cache_dir=CACHE_DIR)
 
 
-def search_with_rerank(query, index, text_metadata):
+def search_with_rerank(query, index, text_metadata, use_hyde=True, debug=False):
+    debug_data = {
+        "mode": None,
+        "query": query,
+        "search_query": None,
+        "faiss_results": [],
+        "rerank_results": []
+    }
+
     ranker = get_ranker()
     query = query.strip()
     if not query:
         logger.warning("Empty query provided to search_with_rerank")
-        return [], None
+        return [], None, None
 
     page_match = re.search(r"page\s+(\d+)", query.lower())
     target_page = int(page_match.group(1)) if page_match else None
 
+    # PAGE MODE
     if target_page:
         start_time = time.perf_counter()
+        debug_data["mode"] = "page"
+        debug_data["search_query"] = query  # no augmentation in page mode
 
         candidates = [
             item for item in text_metadata
@@ -389,55 +415,102 @@ def search_with_rerank(query, index, text_metadata):
 
         if not candidates:
             logger.warning(f"No candidates found for page {target_page}")
-            return [], page_match
+            return [], page_match, None
 
         rerank_items = [
             {
                 "id": i,
-                "text": c["text"],
+                "text": c["full_context"][:1500],
                 "page": c["page"],
-                "full_context": c.get("full_context", "")
+                "full_context": c["full_context"],
+                "faiss_score": 1.0  # no FAISS in page mode — direct filter
             }
             for i, c in enumerate(candidates)
         ]
 
-        rerank_request = RerankRequest(query=query, passages=rerank_items)
-        results = ranker.rerank(rerank_request)
+        results = ranker.rerank(RerankRequest(query=query, passages=rerank_items))
+
+        if debug:
+            for res in results[:TOP_K]:
+                debug_data["rerank_results"].append({
+                    "page": res["page"],
+                    "score": res["score"],
+                    "faiss_score": 1.0,
+                    "text": res["text"][:300]
+                })
 
         end_time = time.perf_counter()
         logger.info(f"[PAGE MODE] Page {target_page} | Time: {end_time - start_time:.2f}s")
+        return results[:TOP_K], page_match, debug_data if debug else None
 
-        return results, page_match
-
+    # SEMANTIC MODE
+    debug_data["mode"] = "semantic"
     start_time = time.perf_counter()
 
-    # HyDE (only for semantic queries)
-    hypothetical_answer = generate_hypothetical_answer(query)
-    search_query = f"{query} {hypothetical_answer}"
+    # Optional HyDE
+    if use_hyde:
+        hypothetical_answer = generate_hypothetical_answer(query,st.session_state.messages)
+        search_query = f"{query} {hypothetical_answer}"
+        logger.debug("HyDE enabled — augmented query generated")
+    else:
+        search_query = query
+        logger.debug("HyDE disabled — using raw query")
+
+    debug_data["search_query"] = search_query
 
     # Embedding
     response = ollama.embed(model=EMBED_MODEL, input=search_query)
     query_vector = np.array(response["embeddings"][0], dtype=np.float32)
     query_vector /= np.linalg.norm(query_vector)
 
+    # FAISS search
     faiss_start = time.perf_counter()
     distances, indices = index.search(query_vector.reshape(1, -1), k=FAISS_SEARCH_K)
     faiss_end = time.perf_counter()
 
-    candidates = [text_metadata[i] for i in indices[0]]
+    # Preserve FAISS scores alongside metadata
+    candidates = []
+    for rank, idx in enumerate(indices[0]):
+        item = {
+            **text_metadata[idx],
+            "faiss_score": float(distances[0][rank])
+        }
+        candidates.append(item)
 
+        if debug:
+            debug_data["faiss_results"].append({
+                "page": item["page"],
+                "score": item["faiss_score"],
+                "text": item["text"][:300],
+                "full_context": item["full_context"][:1000]
+            })
+
+    logger.debug("\n=== FAISS RESULTS ===")
+    for c in candidates[:5]:
+        logger.debug(f"FAISS Score: {c['faiss_score']:.4f} | Page {c['page']}")
+
+    # Rerank using full context for better signal
     rerank_items = [
         {
             "id": i,
-            "text": c["text"],
+            "text": c["full_context"][:1500],
             "page": c["page"],
-            "full_context": c.get("full_context", "")
+            "full_context": c["full_context"],
+            "faiss_score": c["faiss_score"]
         }
         for i, c in enumerate(candidates)
     ]
 
-    rerank_request = RerankRequest(query=query, passages=rerank_items)
-    results = ranker.rerank(rerank_request)
+    results = ranker.rerank(RerankRequest(query=query, passages=rerank_items))
+
+    if debug:
+        for res in results:
+            debug_data["rerank_results"].append({
+                "page": res["page"],
+                "score": res["score"],
+                "faiss_score": res.get("faiss_score", 0),
+                "text": res["text"][:300]
+            })
 
     end_time = time.perf_counter()
 
@@ -445,12 +518,14 @@ def search_with_rerank(query, index, text_metadata):
     logger.debug(f"  → FAISS Time: {faiss_end - faiss_start:.2f}s")
     logger.debug(f"  → Candidates: {len(candidates)}")
 
-    logger.debug("\n--- Re-ranker Scores ---")
+    logger.debug("\n=== FINAL SCORES ===")
     for i, res in enumerate(results[:TOP_K]):
-        logger.debug(f"Rank {i + 1}: Score {res['score']:.4f} (Page {res['page']})")
-    logger.debug("------------------------\n")
+        logger.debug(
+            f"Rank {i + 1}: Rerank={res['score']:.6f}, FAISS={res.get('faiss_score', 0):.4f}, Page={res['page']}"
+        )
+    logger.debug("----------------------\n")
 
-    return results[:TOP_K], page_match
+    return results[:TOP_K], page_match, debug_data if debug else None
 
 
 def compress_context(query, full_text):
@@ -562,6 +637,66 @@ def get_ollama_models():
         return [DEFAULT_THINKING_MODEL]
 
 
+def render_debug_panel(debug_data):
+    """Renders the RAG debug panel. Only called when debug mode is enabled."""
+    import matplotlib.pyplot as plt  # lazy import — only loaded when debug panel is shown
+
+    st.markdown("---")
+    st.markdown("## 🧪 RAG Debug Panel")
+
+    mode_label = "📄 Page Mode" if debug_data["mode"] == "page" else "🔍 Semantic Mode"
+    st.caption(f"**Search Mode:** {mode_label}")
+
+    with st.expander("🔍 Query Analysis", expanded=True):
+        st.write("**Original Query:**")
+        st.code(debug_data["query"])
+        st.write("**Search Query:**")
+        st.code(debug_data["search_query"])
+
+    if debug_data["faiss_results"]:
+        with st.expander("📊 FAISS Retrieval", expanded=False):
+            for i, item in enumerate(debug_data["faiss_results"], 1):
+                st.markdown(f"### Rank {i} | Score: {item['score']:.4f} | Page {item['page']}")
+                st.caption(item["text"])
+                with st.expander("📄 Full Context"):
+                    st.text(item["full_context"])
+    else:
+        with st.expander("📊 FAISS Retrieval", expanded=False):
+            st.info("No FAISS search in page mode — candidates filtered directly by page number.")
+
+    with st.expander("🔁 Reranking Results", expanded=False):
+        for i, item in enumerate(debug_data["rerank_results"], 1):
+            st.markdown(
+                f"### Rank {i} | "
+                f"Rerank: {item['score']:.6f} | "
+                f"FAISS: {item['faiss_score']:.4f} | "
+                f"Page {item['page']}"
+            )
+            st.caption(item["text"])
+
+    if debug_data["faiss_results"] and debug_data["rerank_results"]:
+        with st.expander("⚖️ FAISS vs Rerank", expanded=False):
+            for i in range(min(len(debug_data["faiss_results"]), len(debug_data["rerank_results"]))):
+                f = debug_data["faiss_results"][i]
+                r = debug_data["rerank_results"][i]
+                st.write(
+                    f"Chunk {i + 1} → "
+                    f"FAISS: {f['score']:.4f} | "
+                    f"Rerank: {r['score']:.6f}"
+                )
+
+        with st.expander("📈 Score Distribution", expanded=False):
+            faiss_scores = [x["score"] for x in debug_data["faiss_results"]]
+            rerank_scores = [x["score"] for x in debug_data["rerank_results"]]
+
+            fig, ax = plt.subplots()
+            ax.plot(faiss_scores, label="FAISS")
+            ax.plot(rerank_scores, label="Rerank")
+            ax.legend()
+            st.pyplot(fig)
+            plt.close(fig)
+
+
 def main():
     st.markdown("""
     <style>
@@ -611,6 +746,10 @@ def main():
         st.session_state.thinking_model = DEFAULT_THINKING_MODEL
     if "override_db" not in st.session_state:
         st.session_state.override_db = False
+    if "use_hyde" not in st.session_state:
+        st.session_state.use_hyde = True
+    if "debug_rag" not in st.session_state:
+        st.session_state.debug_rag = False
     if "messages" not in st.session_state:
         st.session_state.messages = []
     if "uploaded_file_name" not in st.session_state:
@@ -742,6 +881,19 @@ def main():
                 help="Force re-indexing even if a cached database exists for this PDF"
             )
 
+            st.markdown("---")
+            st.subheader("Search")
+            st.session_state.use_hyde = st.checkbox(
+                "Enable HyDE",
+                value=st.session_state.use_hyde,
+                help="Hypothetical Document Embedding — generates a fake answer to improve semantic search. Adds ~1-2s per query but improves retrieval quality."
+            )
+            st.session_state.debug_rag = st.checkbox(
+                "Enable RAG Debug Panel",
+                value=st.session_state.debug_rag,
+                help="Shows FAISS scores, rerank scores, and query analysis after each response. Disable in production."
+            )
+
         st.markdown("---")
 
         # System Info (outside expander — read-only status, not a setting)
@@ -783,7 +935,6 @@ def main():
     st.title("Chat with your PDF")
     st.markdown("*Ask questions about your uploaded document*")
 
-    # Change 3: fixed welcome screen condition
     if st.session_state.index is None:
         st.info("👋 **Welcome to Chat PDF!**")
         st.markdown("""
@@ -822,7 +973,6 @@ def main():
                     st.markdown(f"**You:** {message['content']}")
                 else:
                     st.markdown(message["content"])
-                    # Render per-message metrics if stored
                     if "response_stats" in message:
                         ms = message["response_stats"]
                         st.markdown("---")
@@ -844,9 +994,17 @@ def main():
                             st.caption(f"**Source Pages:** {', '.join(map(str, ms['pages']))}")
                             with st.expander("🔍 View Relevance Scores", expanded=False):
                                 for i, res in enumerate(ms['results'], 1):
-                                    score = res['score']
-                                    score_str = f"{score:.4f}" if score is not None else "N/A"
-                                    st.write(f"**Rank {i}:** Page {res['page']} (Score: {score_str})")
+                                    rerank_score = res.get('score', 0)
+                                    faiss_score = res.get('faiss_score', 0)
+                                    st.write(
+                                        f"**Rank {i}:** Page {res['page']} | "
+                                        f"Rerank: {rerank_score:.6f} | "
+                                        f"FAISS: {faiss_score:.4f}"
+                                    )
+
+                    # Render debug panel if stored and debug mode is on
+                    if st.session_state.debug_rag and "debug_data" in message and message["debug_data"]:
+                        render_debug_panel(message["debug_data"])
 
     # Chat input
     if prompt := st.chat_input("Ask a question about the PDF...", key="chat_input"):
@@ -866,7 +1024,13 @@ def main():
                 full_response = ""
 
                 with st.spinner("Searching document..."):
-                    results, page_match = search_with_rerank(prompt, st.session_state.index, st.session_state.metadata)
+                    results, page_match, debug_data = search_with_rerank(
+                        prompt,
+                        st.session_state.index,
+                        st.session_state.metadata,
+                        st.session_state.use_hyde,
+                        st.session_state.debug_rag
+                    )
 
                 if not results:
                     st.error("No relevant information found in the document.")
@@ -885,7 +1049,6 @@ def main():
                         page_match
                     )
 
-                    # Change 4: try/finally ensures cursor never freezes in history
                     try:
                         for chunk in stream_response:
                             full_response += chunk['response']
@@ -905,8 +1068,9 @@ def main():
                 "gen_time": gen_time,
                 "stats": stats,
                 "pages": sorted(set(res["page"] for res in results)),
-                "results": [{"page": res["page"], "score": res.get("score")} for res in results[:3]]
-            }
+                "results": [{"page": res["page"], "score": res.get("score"), "faiss_score": res.get("faiss_score", 0)} for res in results[:3]]
+            },
+            "debug_data": debug_data
         })
         st.rerun()
 
