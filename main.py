@@ -15,9 +15,7 @@ import tiktoken
 import subprocess
 import atexit
 
-ollama_env = os.environ.copy()
-ollama_env["OLLAMA_FLASH_ATTENTION"] = "1"
-ollama_env["OLLAMA_KV_CACHE_TYPE"] = "q8_0"  # Another 2026 speed optimization
+from sympy import false
 
 logging.basicConfig(
     level=logging.INFO,
@@ -26,6 +24,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
+# --- constants ---
 EMBED_MODEL = "nomic-embed-text:latest"
 DEFAULT_THINKING_MODEL = "gemma3:1b"
 HYDE_MODEL = "gemma3:1b"
@@ -42,6 +41,7 @@ MAX_TOKENS = 250
 OVERLAP_TOKENS = 50
 TOKENIZER_CACHE = "tokenizer_cache"
 FAISS_SEARCH_K = 12
+DEBUG_RAG = True
 
 _ollama_process = None
 
@@ -60,6 +60,8 @@ def start_ollama_server():
     try:
         env = os.environ.copy()
         env["OLLAMA_FLASH_ATTENTION"] = "1"
+        env["OLLAMA_KV_CACHE_TYPE"] = "q8_0"  # Another 2026 speed optimization
+
         _ollama_process = subprocess.Popen(
             ['ollama', 'serve'], env=env,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
@@ -304,15 +306,14 @@ Answer:
         options=options,
     ), stats
 
-
 def generate_hypothetical_answer(query,chat_history):
     """HyDE: Generates a brief fake answer to improve vector search."""
-    history_text = "\n".join([f"{history['role']}: {history['content']}" for history in chat_history[-2:]])
-    prompt = (f"Write a 2-sentence technical summary answering: {query} "
-              f"Conversation History:) {history_text}")
+    recent_user = [m["content"] for m in chat_history[-4:] if m["role"] == "user"]
+    history_text = " | ".join(recent_user[-2:])
+    prompt = (f"Write a 2-sentence technical summary answering: {query}\n"
+              f"Recent user context: {history_text}")
     response = ollama.generate(model=HYDE_MODEL, prompt=prompt, stream=False)
     return response['response']
-
 
 def verify_normalized_embedding(embeddings):
     embeddings_array = np.array(embeddings)
@@ -323,7 +324,6 @@ def verify_normalized_embedding(embeddings):
         logger.info("The embedding is L2 normalized.")
     else:
         logger.warning("The embedding is NOT normalized.")
-
 
 def check_ollama_status(thinking_model):
     try:
@@ -343,7 +343,6 @@ def check_ollama_status(thinking_model):
         logger.error(f"Failed to check Ollama status: {exc}")
         return False
 
-
 def save_vector_db(index, metadata, current_hash):
     if not os.path.exists(DB_FOLDER):
         os.makedirs(DB_FOLDER)
@@ -353,7 +352,6 @@ def save_vector_db(index, metadata, current_hash):
         pickle.dump(data, f)
     logger.info("Saved vector database and PDF Hash value.")
 
-
 def load_vector_db():
     if os.path.exists(DB_FOLDER):
         index = faiss.read_index(os.path.join(DB_FOLDER, "index.faiss"))
@@ -362,7 +360,6 @@ def load_vector_db():
         logger.info("Database loaded successfully.")
         return index, data.get("metadata"), data.get("pdf_hash")
     return None, None, None
-
 
 def calculate_pdf_hash(pdf_file):
     logger.debug(f"Calculating hash for PDF: {pdf_file}")
@@ -378,11 +375,24 @@ def calculate_pdf_hash(pdf_file):
         logger.error(f"Failed to calculate PDF hash: {exc}")
         raise
 
-
 @st.cache_resource
 def get_ranker():
     return Ranker(model_name=RERANK_MODEL, cache_dir=CACHE_DIR)
 
+def get_last_referenced_pages(chat_history):
+    """Extract page numbers from the most recent assistant response."""
+    for msg in reversed(chat_history):
+        if msg["role"] == "assistant":
+            # Most reliable: use stored response_stats pages
+            if "response_stats" in msg and msg["response_stats"].get("pages"):
+                return msg["response_stats"]["pages"]
+            # Fallback: parse citation format [Page X]
+            pages = re.findall(r'\[Page\s+(\d+)\]', msg["content"])
+            if not pages:
+                pages = re.findall(r'\bpage\s+(\d+)\b', msg["content"], re.IGNORECASE)
+            if pages:
+                return list(dict.fromkeys(int(p) for p in pages))
+    return []
 
 def search_with_rerank(query, index, text_metadata, use_hyde=True, debug=False):
     debug_data = {
@@ -402,30 +412,62 @@ def search_with_rerank(query, index, text_metadata, use_hyde=True, debug=False):
     page_match = re.search(r"page\s+(\d+)", query.lower())
     target_page = int(page_match.group(1)) if page_match else None
 
+    # Inherit page context from previous response if query is a vague follow-up
+    vague_followups = re.compile(
+        r"^(explain(\s+\w+){0,3}|elaborate|tell me more|go on|continue|"
+        r"describe(\s+\w+){0,3}|what does (that|this|it) mean|can you expand|"
+        r"more (details?|info)|summarize that|go deeper|keep going|"
+        r"(what|can you|could you)\s+(else|more|further))"
+        r"[\s\w]{0,20}[?!.]*$",
+        re.IGNORECASE
+    )
+    logger.info(f"DEBUG — raw query: '{query}'")
+    logger.info(f"DEBUG — page_match: {page_match}")
+    logger.info(f"DEBUG — target_page: {target_page}")
+    logger.info(f"DEBUG — VAGUE match: {bool(vague_followups.match(query.strip()))}")
+    logger.info(f"DEBUG — last pages: {get_last_referenced_pages(st.session_state.messages)}")
+    if not target_page and vague_followups.match(query.strip()):
+        last_pages = get_last_referenced_pages(st.session_state.messages)
+        if last_pages:
+            page_inject = last_pages[len(last_pages) // 2]
+            logger.info(f"TOP_K: {TOP_K}")
+            logger.info(f"Page Inject: {page_inject}")
+            query = f"{query} page {page_inject}"
+            page_match = re.search(r"page\s+(\d+)", query.lower())
+            target_page = int(page_match.group(1))
+            logger.info(f"Vague follow-up detected — injecting page context: page {page_inject}")
+
     # PAGE MODE
     if target_page:
         start_time = time.perf_counter()
         debug_data["mode"] = "page"
         debug_data["search_query"] = query  # no augmentation in page mode
 
+        allowed_pages = [target_page -1, target_page, target_page + 1]
+
         candidates = [
             item for item in text_metadata
-            if item["page"] == target_page
+            if item["page"] in allowed_pages
         ]
 
         if not candidates:
             logger.warning(f"No candidates found for page {target_page}")
             return [], page_match, None
 
+        page_to_text = {}
+        for item in text_metadata:
+            if item["page"] in allowed_pages:
+                page_to_text[item["page"]] = item["full_context"]
+
         rerank_items = [
             {
                 "id": i,
-                "text": c["full_context"][:1500],
-                "page": c["page"],
-                "full_context": c["full_context"],
+                "text": txt[:1500],
+                "page": p,
+                "full_context": txt,
                 "faiss_score": 1.0  # no FAISS in page mode — direct filter
             }
-            for i, c in enumerate(candidates)
+            for i, (p,txt) in enumerate(sorted(page_to_text.items()))
         ]
 
         results = ranker.rerank(RerankRequest(query=query, passages=rerank_items))
@@ -749,7 +791,7 @@ def main():
     if "use_hyde" not in st.session_state:
         st.session_state.use_hyde = True
     if "debug_rag" not in st.session_state:
-        st.session_state.debug_rag = False
+        st.session_state.debug_rag = DEBUG_RAG
     if "messages" not in st.session_state:
         st.session_state.messages = []
     if "uploaded_file_name" not in st.session_state:
