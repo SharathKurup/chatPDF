@@ -15,8 +15,6 @@ import tiktoken
 import subprocess
 import atexit
 
-from sympy import false
-
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
@@ -44,7 +42,6 @@ FAISS_SEARCH_K = 12
 DEBUG_RAG = True
 
 _ollama_process = None
-
 
 def is_ollama_running():
     try:
@@ -454,10 +451,11 @@ def search_with_rerank(query, index, text_metadata, use_hyde=True, debug=False):
             logger.warning(f"No candidates found for page {target_page}")
             return [], page_match, None
 
-        page_to_text = {}
-        for item in text_metadata:
-            if item["page"] in allowed_pages:
-                page_to_text[item["page"]] = item["full_context"]
+        # page_to_text = {}
+        # for item in text_metadata:
+        #     if item["page"] in allowed_pages:
+        #          page_to_text[item["page"]] = item["full_context"]
+        page_to_text = {item["page"]: item["full_context"] for item in candidates}
 
         rerank_items = [
             {
@@ -503,7 +501,8 @@ def search_with_rerank(query, index, text_metadata, use_hyde=True, debug=False):
     # Embedding
     response = ollama.embed(model=EMBED_MODEL, input=search_query)
     query_vector = np.array(response["embeddings"][0], dtype=np.float32)
-    query_vector /= np.linalg.norm(query_vector)
+    qnorm = np.linalg.norm(query_vector)
+    query_vector /= (qnorm if qnorm != 0 else 1.0)
 
     # FAISS search
     faiss_start = time.perf_counter()
@@ -513,6 +512,8 @@ def search_with_rerank(query, index, text_metadata, use_hyde=True, debug=False):
     # Preserve FAISS scores alongside metadata
     candidates = []
     for rank, idx in enumerate(indices[0]):
+        if idx < 0 or idx >= len(text_metadata):
+            continue
         item = {
             **text_metadata[idx],
             "faiss_score": float(distances[0][rank])
